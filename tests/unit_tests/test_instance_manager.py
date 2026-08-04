@@ -224,6 +224,31 @@ class TestPortAvailability:
             s.close()
 
     @staticmethod
+    @pytest.mark.skipif(os.name == "nt", reason="probe omits SO_REUSEADDR on Windows")
+    def test_is_port_available_true_for_a_time_wait_port():
+        """A port left in TIME-WAIT by a previous run must read as available.
+
+        Regression guard for the silent +1000 drift: a probe without
+        SO_REUSEADDR reads a restarted service's own TIME-WAIT ports as occupied,
+        so the launcher relocates the group though the servers would have bound it.
+        """
+        import socket as _socket
+
+        server = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        port = server.getsockname()[1]
+        server.listen(1)
+        client = _socket.create_connection(("127.0.0.1", port))
+        accepted, _ = server.accept()
+        # Closing the listening side first is what parks this port in TIME-WAIT.
+        server.close()
+        accepted.close()
+        client.close()
+
+        assert is_port_available("127.0.0.1", port) is True
+
+    @staticmethod
     def test_is_port_available_true_when_free(tmp_path):
         """A genuinely free ephemeral port is reported as available."""
         import socket as _socket
@@ -1157,10 +1182,10 @@ class TestStartServicesFallback:
 
         # Make index-1 group occupied; everything else free
         occupied = set(calculate_instance_ports(1).values())
-        real = is_port_available
-
         def fake(host, port):
-            return port not in occupied and real(host, port)
+            # Not the real machine: on a host already running instances the
+            # scan would skip past the index asserted below.
+            return port not in occupied
 
         monkeypatch.setattr(
             "jiuwenswarm.instance_manager.config.is_port_available", fake
@@ -1208,10 +1233,10 @@ class TestStartServicesFallback:
 
         # Force ONLY the index-0 group to be occupied; every higher index free.
         occupied = set(calculate_instance_ports(0).values())
-        real = is_port_available
-
         def fake(host, port):
-            return port not in occupied and real(host, port)
+            # Not the real machine: on a host already running instances the
+            # scan would skip past the index asserted below.
+            return port not in occupied
 
         monkeypatch.setattr(
             "jiuwenswarm.instance_manager.config.is_port_available", fake
@@ -1288,10 +1313,10 @@ class TestStartServicesFallback:
         # Only index-0 occupied so a fallback group IS found — but then make
         # the .env write raise so the persistence path fails.
         occupied = set(calculate_instance_ports(0).values())
-        real = is_port_available
-
         def fake_probe(host, port):
-            return port not in occupied and real(host, port)
+            # Not the real machine: on a host already running instances the
+            # scan would skip past the index asserted below.
+            return port not in occupied
 
         monkeypatch.setattr(
             "jiuwenswarm.instance_manager.config.is_port_available", fake_probe

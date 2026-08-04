@@ -198,10 +198,17 @@ def _bind_listen_probe(host: str, port: int, family: int) -> bool | None:
         sock = socket.socket(family, socket.SOCK_STREAM)
     except OSError:
         return None
-    # Intentionally NOT setting SO_REUSEADDR: on Windows it permits multiple
-    # sockets to bind the same port, which would mask an occupied port and
-    # reproduce the very 10048 crash we are trying to avoid. The real services
-    # do not set it either.
+    # POSIX only, matching the servers: uvicorn sets it in bind_socket(),
+    # asyncio defaults reuse_address=True. Without it the probe is stricter than
+    # the bind it predicts -- a port left in TIME-WAIT by the service's own
+    # previous run reads as occupied and the launcher shifts the whole group by
+    # +1000. Not on Windows, where the flag lets two sockets share a port and
+    # would mask a real conflict (the WinError 10048 this probe exists to prevent).
+    if os.name != "nt":
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError:
+            pass
     try:
         sock.bind((host, port))
         sock.listen(1)
@@ -228,10 +235,9 @@ def _bind_listen_probe(host: str, port: int, family: int) -> bool | None:
 def is_port_available(host: str, port: int) -> bool:
     """Check if a port is available for binding on the given host.
 
-    Probes by attempting to ``bind()``+``listen()`` (without SO_REUSEADDR) and
-    immediately closing. This mirrors how the real services (AgentServer /
-    Gateway / Web / Frontend) actually acquire their ports, so it correctly
-    detects:
+    Probes by attempting to ``bind()``+``listen()`` and immediately closing,
+    with the same ``SO_REUSEADDR`` setting the real services (AgentServer /
+    Gateway / Web / Frontend) use on this platform, so it correctly detects:
 
     - A live service listening on the port (bind fails -> occupied).
     - A *stuck/zombie* listener that is in LISTENING state but no longer
