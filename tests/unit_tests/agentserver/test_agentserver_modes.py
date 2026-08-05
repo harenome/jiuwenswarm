@@ -1699,7 +1699,11 @@ def test_deep_adapter_handle_user_answer_ignores_team_plan_approval_compat(monke
         lambda _channel_id: pytest.fail("team_plan_approval should not route via interact"),
     )
 
+    # Answer on this adapter rather than delegating to a per-session one, which
+    # handle_user_answer would otherwise build: a live agent instance and its
+    # model client, reaching the configured api_base over the network.
     adapter = JiuWenSwarmDeepAdapter()
+    adapter._is_session_scoped_adapter = True
     request = AgentRequest(
         request_id="req-answer",
         channel_id="tui",
@@ -1736,7 +1740,10 @@ def test_deep_adapter_routes_team_simplify_answer_by_evolution_meta(monkeypatch)
         async def on_reject_simplify(self, request_id: str) -> None:
             pytest.fail("team simplify approval must not use regular SkillEvolutionRail")
 
+    # Same reason as above, and it is what makes the rail below take effect:
+    # delegating would consult the session adapter's rail, not this one.
     adapter = JiuWenSwarmDeepAdapter()
+    adapter._is_session_scoped_adapter = True
     adapter._skill_evolution_rail = FailingRegularRail()
     monkeypatch.setattr(
         JiuWenSwarmDeepAdapter,

@@ -728,6 +728,14 @@ async def test_bootstrap_allows_later_kickoff_for_same_member_after_task_done(mo
         fake_replace_card_after_direct_bootstrap,
     )
 
+    async def no_member_status(*args, **kwargs):
+        return None
+
+    # The real lookup builds a team agent and its model client, reaching the
+    # configured api_base over the network. It already returns None on any
+    # exception, so the status is unavailable here either way -- state it.
+    monkeypatch.setattr(_mod, "_member_status_for_session", no_member_status)
+
     processed = set()
     loop_kicked_members = set()
     kickoff_tasks = set()
