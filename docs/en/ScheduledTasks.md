@@ -105,8 +105,10 @@ The task is automatically assigned to the project matching `project_dir` (falls 
 
 Scheduled task configurations are saved at:
 ```
-~/.jiuwenswarm/agent/home/cron_jobs.json
+~/.jiuwenswarm/gateway/cron_jobs.json
 ```
+
+> The path follows the workspace layout. A deployment that has not run the workspace migration still keeps the file at `~/.jiuwenswarm/agent/home/cron_jobs.json`; the resolver reads whichever one exists, so both layouts work.
 
 ### Create via Chat
 

@@ -2379,14 +2379,32 @@ def get_interactions_dir() -> Path:
 
 
 def get_cron_jobs_path() -> Path:
-    """Canonical path for cron_jobs.json shared by gateway and agentserver."""
-    return get_user_workspace_dir() / "agent" / "home" / "cron_jobs.json"
+    """Path to cron_jobs.json, following wherever this workspace keeps it.
+
+    1. ``gateway/`` if present -- ``_migrate_legacy_workspace`` has run.
+    2. ``agent/home/`` if present -- it has not; repointing unconditionally
+       would empty the schedules of every deployment that never migrated.
+    3. ``gateway/`` otherwise: a fresh workspace then has no cron reason to
+       create ``agent/home``, one of the three directories whose presence
+       ``prepare_workspace`` reads as a legacy layout. Other components can
+       still create it.
+    """
+    workspace = get_user_workspace_dir()
+    gateway_path = workspace / "gateway" / "cron_jobs.json"
+    legacy_path = workspace / "agent" / "home" / "cron_jobs.json"
+    if gateway_path.exists():
+        return gateway_path
+    if legacy_path.exists():
+        return legacy_path
+    return gateway_path
 
 
 def get_heartbeat_jobs_path() -> Path:
     """Canonical path for heartbeat_jobs.json (new thread-automation heartbeat jobs).
 
-    与 ``get_cron_jobs_path`` 同目录(``agent/home``),禁止在业务代码中硬编码该路径。
+    位于 ``agent/home``,禁止在业务代码中硬编码该路径。注意它与
+    ``get_cron_jobs_path`` 不再必然同目录:后者跟随工作区迁移,迁移过的部署上
+    指向 ``gateway/``。
     """
     return get_agent_home_dir() / "heartbeat_jobs.json"
 

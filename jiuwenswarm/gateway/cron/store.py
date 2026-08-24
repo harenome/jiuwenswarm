@@ -115,7 +115,14 @@ class _ProactiveJobProtected(RuntimeError):
 
 
 class CronJobStore:
-    """Persist cron jobs to ~/.jiuwenswarm/agent/home/cron_jobs.json.
+    """Persist cron jobs to this workspace's ``cron_jobs.json``.
+
+    The location is not fixed. ``get_cron_jobs_path`` resolves it against what
+    is on disk -- ``gateway/cron_jobs.json`` once the workspace migration has
+    relocated the file, ``agent/home/cron_jobs.json`` on a deployment that
+    never migrated -- so that neither layout is stranded. The gateway scheduler
+    and the agent-side read-only view both pass that resolved path in; the
+    ``path=None`` default falls back to the same lookup.
 
     并发安全:
       - ``asyncio.Lock``：同进程协程互斥；
@@ -514,17 +521,35 @@ class CronJobStore:
         path = self._path
         try:
             if not path.exists():
+                # Not a fault of this layer: the caller that cares reports it.
                 return {"version": 1, "jobs": []}
             raw = path.read_text(encoding="utf-8")
             data = json.loads(raw) if raw.strip() else {}
             if not isinstance(data, dict):
+                logger.warning(
+                    "Cron store %s holds a JSON %s where an object was expected; "
+                    "reading it as empty -- no schedule runs until it is repaired",
+                    path,
+                    type(data).__name__,
+                )
                 return {"version": 1, "jobs": []}
             if "version" not in data:
                 data["version"] = 1
             if "jobs" not in data:
                 data["jobs"] = []
             return data
-        except Exception:
+        except Exception as exc:
+            # Reading on returns an empty store rather than raising, so that one
+            # damaged file cannot take the gateway down with it. Say so: an
+            # unreported empty read is indistinguishable from a store that
+            # genuinely holds nothing.
+            logger.warning(
+                "Cron store %s could not be read (%s: %s); reading it as empty "
+                "-- no schedule runs until it is repaired",
+                path,
+                type(exc).__name__,
+                exc,
+            )
             return {"version": 1, "jobs": []}
 
     def _write_json_unlocked(self, data: dict[str, Any]) -> None:

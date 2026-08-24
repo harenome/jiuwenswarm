@@ -407,7 +407,7 @@ rsync -av ~/.jiuwenswarm ~/.jiuwenswarm_backup
 | `agent/workspace/` | Identity, task, and workspace files |
 | `agent/workspace/memory/` | User memory data |
 | `agent/workspace/skills/` | Skills library (custom skills and config) |
-| `agent/home/` | Scheduled task data (`cron_jobs.json`) |
+| `gateway/cron_jobs.json` | Scheduled task data (`agent/home/cron_jobs.json` on deployments that have not migrated) |
 
 > `agent/jiuwenclaw_workspace/`, `agent/memory/`, and `agent/skills/` are legacy locations. Current versions migrate their contents into `agent/workspace/`.
 
