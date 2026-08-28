@@ -20,6 +20,12 @@ from jiuwenswarm.agents.harness.code.rails.code_plan_approval_interrupt_rail imp
     is_plan_approval_message,
     strip_inline_plan_approval_choices,
 )
+from jiuwenswarm.agents.harness.common.rails.interrupt.permission_options import (
+    ALLOW_ONCE,
+    ALWAYS_ALLOW,
+    REJECT,
+    SESSION_ALLOW,
+)
 from jiuwenswarm.common.utils import logger
 
 SKILL_EVOLUTION_APPROVAL_SCHEMA = "openjiuwen.skill_evolution_approval.v1"
@@ -769,12 +775,15 @@ def _normalize_question_option(option: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+# 权限审批的兜底选项。``value`` 取自 ``permission_options``，与解析回答用的是同一份
+# 词表：web / CLI 回传 ``value``，TUI 回传 ``label``，两条路都要能被 ``build_inputs``
+# 解出同一个动作。label / description 保持原样，渲染出的文案不变。
 def _default_interrupt_options() -> list[dict[str, str]]:
     return [
-        {"label": "本次允许", "description": "仅本次授权执行"},
-        {"label": "会话内记住", "description": "本次会话内自动放行同类操作"},
-        {"label": "永久记住", "description": "写回磁盘，所有会话均自动放行"},
-        {"label": "拒绝", "description": "拒绝执行此工具"},
+        {"value": ALLOW_ONCE, "label": "本次允许", "description": "仅本次授权执行"},
+        {"value": SESSION_ALLOW, "label": "会话内记住", "description": "本次会话内自动放行同类操作"},
+        {"value": ALWAYS_ALLOW, "label": "永久记住", "description": "写回磁盘，所有会话均自动放行"},
+        {"value": REJECT, "label": "拒绝", "description": "拒绝执行此工具"},
     ]
 
 
