@@ -1483,6 +1483,8 @@ channels:
     # something to leave on. Note that logging.console and logging.full still
     # have to allow the level for it to appear; the channel logs the resulting
     # floor when it starts.
+    # Optional JSON question overrides, relative to the configuration directory.
+    decision_questions_file: ""
     sdk_log_level: WARNING
     # Emoji names without the surrounding colons. Reactions need reactions:write.
     #

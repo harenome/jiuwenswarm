@@ -3095,6 +3095,9 @@ async def _run(
                             slack_conf.get("stopped_emoji"),
                             "black_square_for_stop",
                         ),
+                        decision_questions_file=slack_conf.get(
+                            "decision_questions_file", ""
+                        ),
                         sdk_log_level=resolve_sdk_log_level(slack_conf),
                         enable_streaming=enable_streaming,
                         blockkit_tables=blockkit_tables,

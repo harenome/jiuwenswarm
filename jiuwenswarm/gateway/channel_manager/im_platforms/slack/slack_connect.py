@@ -8,6 +8,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
@@ -111,6 +112,14 @@ from jiuwenswarm.common.slack_text import (
 )
 from jiuwenswarm.gateway.channel_manager.im_platforms.slack import (
     slack_inputs,
+)
+from jiuwenswarm.gateway.channel_manager.im_platforms.slack.decision_questions import (
+    QuestionConfigurationError,
+    ShadowDecisionGate,
+    bot_identity as decision_bot_identity,
+    load_questions,
+    message_entry,
+    question_changes,
 )
 from jiuwenswarm.gateway.channel_manager.im_platforms.slack.scope_capabilities import (
     SLACK_CAPABILITIES,
@@ -5034,6 +5043,8 @@ class SlackChannelConfig:
     completed_emoji: str = _DEFAULT_COMPLETED_EMOJI
     failed_emoji: str = _DEFAULT_FAILED_EMOJI
     stopped_emoji: str = _DEFAULT_STOPPED_EMOJI
+    # Optional JSON definitions, loaded once when this connector starts.
+    decision_questions_file: str = ""
     # Level for the slack_bolt and slack_sdk logger trees, which are wired into
     # the shared handlers when the channel starts. Its own key rather than
     # logging.level because these two are an order of magnitude chattier than
@@ -6203,6 +6214,15 @@ class SlackChannel(BaseChannel):
         # actually receives traffic in. One short string per conversation, so
         # there is nothing here to evict.
         self._chat_types: dict[str, str] = {}
+        # The decision gate, built on first use and only where
+        # ``models.decision`` names a model. ``False`` is "asked and there is
+        # none", which is the common case and must cost nothing per message:
+        # without it every arriving message would re-read the configuration to
+        # be told the same thing.
+        #
+        # It runs in shadow. It records what it would have decided and changes
+        # nothing about this path -- see ``_observe_decision_in_shadow``.
+        self._decision_gate: ShadowDecisionGate | None | bool = None
 
     @property
     def channel_id(self) -> str:
@@ -6280,6 +6300,8 @@ class SlackChannel(BaseChannel):
         if self._running:
             logger.warning("SlackChannel is already running")
             return
+
+        self._shadow_decision_gate()
 
         # Before the app is built, because the logger it returns is what the app
         # is built with: bolt copies a base logger's level, handlers and filters
@@ -6392,6 +6414,18 @@ class SlackChannel(BaseChannel):
                 len(self._queued_messages),
             )
         self._queued_messages.clear()
+        # A shadow decision outlives the message it was about by as long as
+        # the model takes, and a stopped channel has nothing to record it
+        # against. Cancelled rather than awaited: nothing downstream is waiting
+        # for one, and a stop that waited on a network call would be a stop the
+        # decision model could delay.
+        gate = self._decision_gate
+        self._decision_gate = None
+        if isinstance(gate, ShadowDecisionGate):
+            try:
+                await gate.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("[SlackChannel] shadow decisions unstopped", exc_info=True)
         # A buffered event is context for the next turn, and a stopped channel
         # has no next turn. Keeping them would have a restarted channel open by
         # describing a room as it stood before the reconfiguration.
@@ -15142,6 +15176,206 @@ class SlackChannel(BaseChannel):
 
         await self._route_request(req)
 
+    # ------------------------------------------------------------------
+    # The decision gate, in shadow
+    # ------------------------------------------------------------------
+    #
+    # **Nothing below may change what this connector does.** The gate asks a
+    # decision model what it would have done with an arriving message and
+    # writes the answer to the log. No turn is skipped, no output withheld, no
+    # reaction sent, and nothing is forwarded to the turn.
+    #
+    # Four properties make that structural rather than careful.
+    #
+    # ``_observe_decision_in_shadow`` returns ``None``, so its caller has no
+    # value to branch on. It contains no ``await``, so the handler does not
+    # yield to it. Everything it starts runs in a task of its own, under a
+    # budget, with every exception caught. And the only thing that task can
+    # produce is a line in the log.
+    #
+    # The position follows the design and three constraints pin it. It is not
+    # a trigger, because a trigger value has to be answerable from the payload
+    # alone and "ask a model" is not. It is outside the dedupe lock, which is
+    # held across a call and would queue every inbound event in the workspace
+    # behind a network request. And it precedes the acknowledgement reaction,
+    # which is the first outward act of the whole path: a decision taken after
+    # it would mean the bot visibly reacting to a message it then ignored.
+
+    def _shadow_decision_gate(self) -> ShadowDecisionGate | None:
+        """The gate, or ``None`` where no decision model is configured.
+
+        Built once. An absent ``models.decision`` is the off switch, and the
+        answer is remembered so the common case costs one attribute read per
+        message rather than a configuration parse.
+        """
+        if self._decision_gate is False:
+            return None
+        if isinstance(self._decision_gate, ShadowDecisionGate):
+            return self._decision_gate
+        try:
+            from jiuwenswarm.common.config import get_config
+            from jiuwenswarm.common.typed_decision import build_client
+
+            client = build_client(get_config() or {})
+        except Exception:  # noqa: BLE001 - reading config may not break a turn
+            logger.debug("[SlackChannel] no decision gate", exc_info=True)
+            self._decision_gate = False
+            return None
+        if client is None:
+            self._decision_gate = False
+            return None
+        try:
+            from jiuwenswarm.common.utils import get_config_dir
+
+            path = self.config.decision_questions_file
+            if path:
+                if not isinstance(path, str):
+                    raise QuestionConfigurationError("question file path must be a string")
+                path = Path(path).expanduser()
+                if not path.is_absolute():
+                    path = Path(get_config_dir()) / path
+            questions = load_questions(path)
+        except Exception as exc:  # noqa: BLE001 - optional config must not stop chat
+            logger.error(
+                "[SlackChannel] decision disabled: invalid decision_questions_file (%s)",
+                str(exc)
+                if isinstance(exc, QuestionConfigurationError)
+                else type(exc).__name__,
+            )
+            self._decision_gate = False
+            return None
+        for action, question_id in question_changes(questions):
+            logger.info(
+                "[SlackChannel] decision question %s: %s",
+                action,
+                json.dumps(question_id, ensure_ascii=True),
+            )
+        if not questions:
+            logger.info("[SlackChannel] decision disabled: all questions disabled")
+            self._decision_gate = False
+            return None
+        gate = ShadowDecisionGate(
+            client, recent_messages=self._decision_window, questions=questions
+        )
+        self._decision_gate = gate
+        return gate
+
+    async def _decision_window(
+        self, channel_id: str, limit: int, before_ts: str
+    ) -> list[dict[str, Any]]:
+        """The conversation's recent lines, the bot's own turns included.
+
+        **The bot's turns are the point.** Every measurement behind this design
+        was taken on a state that held none of them, which is why the real
+        reason two labelled lines were silent -- that the bot had already
+        spoken -- was invisible to the model. There is no in-memory record of
+        message text on this path, so the window is read from the conversation,
+        where the bot's posts already sit beside everybody else's.
+
+        **This is not the history tool and ``channels.slack.history`` does not
+        govern it.** That word decides which conversations a *turn* may be
+        given a tool to read, and its default is ``disabled``. This reads one
+        conversation only -- the one the message arrived in, which this
+        connector is a member of and already receives every message of. It
+        never names another. What licenses the read is ``models.decision``
+        being configured at all: with no decision model there is no gate, no
+        request and no window.
+
+        A missing scope, a rate limit or an unreachable API is an empty window
+        rather than a failure. The record says how many lines went in, so an
+        analysis can separate the decisions taken with context from the ones
+        taken without it.
+
+        Runs inside the shadow task. Its caller swallows whatever this raises.
+        """
+        client = self._client
+        if client is None or not channel_id or not re.fullmatch(r"[0-9]+\.[0-9]+", before_ts):
+            return []
+        cutoff = Decimal(before_ts)
+        response = await client.conversations_history(
+            channel=channel_id, limit=max(1, int(limit)), latest=before_ts, inclusive=False
+        )
+        messages = response.get("messages") or []
+        bot_user_id = self._bot_user_id
+        window: list[dict[str, Any]] = []
+        # Slack returns newest first and the state reads oldest first, which is
+        # the order the conversation happened in.
+        for raw in reversed(list(messages)):
+            if not isinstance(raw, dict):
+                continue
+            timestamp = str(raw.get("ts") or "")
+            # Exclude the target and newer messages even if the API includes them.
+            if not re.fullmatch(r"[0-9]+\.[0-9]+", timestamp) or Decimal(timestamp) >= cutoff:
+                continue
+            author = str(raw.get("user") or raw.get("bot_id") or "").strip()
+            label = (
+                self.config.bot_name or "the assistant"
+                if author and author == bot_user_id
+                else f"<@{author}>" if author else "someone"
+            )
+            window.append(message_entry(
+                label,
+                str(raw.get("text") or ""),
+                ts=str(raw.get("ts") or ""),
+                thread_ts=str(raw.get("thread_ts") or ""),
+                file_count=len(self._collect_event_files(raw)),
+                attachment_count=len(self._collect_event_attachments(raw)),
+            ))
+        return window
+
+    def _observe_decision_in_shadow(
+        self,
+        event: Mapping[str, Any],
+        body: Mapping[str, Any],
+        *,
+        channel_id: str,
+        message_ts: str,
+        thread_ts: str,
+        user_id: str,
+        chat_type: str,
+        is_dm: bool,
+        trigger: str,
+        text: str,
+    ) -> None:
+        """Record what the decision model would have decided. Change nothing.
+
+        Returns ``None`` and raises nothing. Both are the contract: with no
+        value returned there is nothing a caller can read, and with nothing
+        raised there is nothing a caller has to handle.
+        """
+        try:
+            gate = self._shadow_decision_gate()
+            if gate is None:
+                return
+            gate.observe(
+                channel=channel_id,
+                bot_name=decision_bot_identity(
+                    self.config.bot_name, self._bot_user_id
+                ),
+                last_message=message_entry(
+                    f"<@{user_id}>", text,
+                    ts=message_ts,
+                    thread_ts=thread_ts,
+                    file_count=len(self._collect_event_files(event)),
+                    attachment_count=len(self._collect_event_attachments(event)),
+                ),
+                chat_type=chat_type,
+                # Enough to find the message again, and no message text: these
+                # lines persist and the content is the users'.
+                identity={
+                    "team": self._team_id(body, event),
+                    "channel": channel_id,
+                    "ts": message_ts,
+                    "thread_ts": thread_ts,
+                    "user": user_id,
+                    "chat_type": chat_type,
+                    "is_dm": is_dm,
+                    "trigger": trigger,
+                },
+            )
+        except Exception:  # noqa: BLE001 - a shadow may not raise into a turn
+            logger.debug("[SlackChannel] shadow decision skipped", exc_info=True)
+
     async def _handle_slack_event(
         self,
         event: dict[str, Any],
@@ -15307,6 +15541,24 @@ class SlackChannel(BaseChannel):
         # empty, which cost it its turn, its acknowledgement and any record that
         # something had been posted.
         attachments = self._collect_event_attachments(event)
+
+        # Above the acknowledgement, and it changes nothing about anything
+        # below it. The call returns ``None``, does not await, and produces one
+        # line in the log -- see ``_observe_decision_in_shadow``. With no
+        # decision model configured it returns before doing any work at all.
+        self._observe_decision_in_shadow(
+            event,
+            body,
+            channel_id=channel_id,
+            message_ts=message_ts,
+            thread_ts=thread_ts,
+            user_id=user_id,
+            chat_type=chat_type,
+            is_dm=is_dm,
+            trigger=trigger,
+            # Preserve mentions for the audience question.
+            text=str(event.get("text") or "").strip(),
+        )
 
         # Acknowledged before the attachments are fetched. A download takes as
         # long as the upload is large, and an acknowledgement sequenced after it

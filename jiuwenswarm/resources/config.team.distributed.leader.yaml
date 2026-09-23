@@ -460,6 +460,8 @@ channels:
     # logging.level because they are far chattier: DEBUG writes a line per
     # websocket frame and per dispatched envelope, which answers "did Slack
     # actually send us that message?" and is not something to leave on.
+    # Optional JSON question overrides, relative to the configuration directory.
+    decision_questions_file: ""
     sdk_log_level: WARNING
     acknowledgement_emoji: eyes
     rejected_emoji: no_entry_sign
