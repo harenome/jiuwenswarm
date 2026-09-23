@@ -391,6 +391,38 @@ models:
         verify_ssl: true
         timeout: 1800
       model_config_obj: {}
+  # ---- 决策模型 / The decision model (optional; off unless filled in) ----
+  # A model that answers typed questions about a state -- a probability, one
+  # option out of a named set, or a position along an ordered rubric -- instead
+  # of answering in prose. It is asked whether an arriving message warrants a
+  # turn at all, which is a question a payload-only trigger rule cannot reach.
+  #
+  # 缺席即关闭 / Absence is the off switch. There is deliberately no separate
+  # enable flag: a second switch would allow a state where the model is
+  # configured and ignored. An unset ${DECISION_*} variable resolves to the
+  # empty string, and an empty model_name, api_base or api_key reads as
+  # unconfigured, so an untouched deployment behaves exactly as it did before.
+  #
+  # 这四个键必须留在模板里 / All four keys must stay listed here. This template
+  # doubles as the key allow-list on upgrade, and a key absent from it is
+  # deleted out of the operator's own file by _deep_merge.
+  #
+  # client_provider 不在此列 / No client_provider key: this entry is not a chat
+  # model entry and is not built through the chat-model path. The endpoint is
+  # a decisions endpoint, which refuses a chat-completions request outright.
+  #
+  # extra_body 原样并入请求体顶层 / extra_body is merged into the request body
+  # at the top level, which is where an OpenRouter-compatible endpoint reads
+  # the provider block. require_parameters is deliberately absent: a model
+  # that declares no supported parameters routes nowhere under it.
+  decision:
+    api_base: ${DECISION_API_BASE}
+    api_key: ${DECISION_API_KEY}
+    model_name: ${DECISION_MODEL_NAME}
+    model_config_obj:
+      extra_body:
+        provider:
+          order: [TypeSafe]
   # ---- AgentOS 备份模型（可选，不预置；需手动添加）----
   # 此处不预置任何 agentos 条目：jiuwenswarm-init 生成的 config.yaml 不含 agentos 字段。
   # 如需启用备份模型，请手动在 config.yaml 添加 models.agentos 列表段（见文档）。
