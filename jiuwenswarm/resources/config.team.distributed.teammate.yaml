@@ -478,6 +478,19 @@ channels:
 # 内置参数规则 > 用户 rules；整工具存在则不用 defaults；详见 tiered_policy 模块说明。
 #
 # 三种动作: allow / ask / deny
+# Per-conversation and per-sender rules, matched on channel, chat, user and
+# role and layered over the connector's own defaults. See the scopes block in
+# the shipped config.yaml for the composition rules and a worked example.
+scopes: []
+
+# Who a name in a scope's role: refers to. people: maps a person to their id on
+# each platform, roles: groups those people under a name, and neither grants
+# anything -- all authority stays in scopes above. Left bare rather than {}:
+# the names under them are the operator's, and an empty mapping would be read
+# as the complete set allowed and delete them on upgrade.
+people:
+roles:
+
 permissions:
   enabled: false
   schema: tiered_policy
