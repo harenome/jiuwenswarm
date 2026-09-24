@@ -90,6 +90,14 @@ from openjiuwen.harness.rails import (
     SysOperationRail,
     MemoryRail,
 )
+from jiuwenswarm.agents.harness.common.rails.scoped_skill_use_rail import (
+    ScopedSkillUseRail,
+    bind_scoped_skills,
+    reset_scoped_skills,
+    scoped_skill_names,
+    unrestricted_skill_inventory,
+    with_scoped_skill_run_context,
+)
 from openjiuwen.harness.rails import (
     EvolutionInterruptRail,
     SkillCreateRail,
@@ -6066,27 +6074,24 @@ class JiuWenSwarmDeepAdapter:
         toolkit = self._skill_retrieval_toolkit
         if toolkit is not None:
             return toolkit
-        toolkit = SkillRetrievalToolkit(
-            # Match SkillUseRail exactly: selected MCP-bundled Skills are part
-            # of this session's directory, while unselected MCPs stay hidden.
-            skill_directories=self._skill_scan_dirs,
-            # Shared taxonomy generations are built only from JiuwenSwarm's
-            # stable installed inventory. Session-selected MCP Skills remain
-            # visible through the live provider above and appear in a stale
-            # taxonomy under /newly_installed_skills.
-            index_skill_directories=lambda: [str(get_agent_skills_dir())],
-            disabled_skills=self._live_skill_retrieval_disabled_skills,
-            source_by_name=lambda: (
-                skill_sources_from_manager(self._skill_manager)
-                if self._skill_manager is not None
-                else {}
-            ),
-            session_scope=self._skill_retrieval_session_scope(),
-            config_base=self._config_base_cache,
-            settings=getattr(self, "_skill_retrieval_settings", None),
-            auto_build_index=True,
-            frozen_profile=getattr(self, "_restored_skill_retrieval_profile", None),
-        )
+        with unrestricted_skill_inventory():
+            toolkit = SkillRetrievalToolkit(
+                # Selected MCP Skill directories join the main Skill catalog.
+                skill_directories=self._skill_scan_dirs,
+                index_skill_directories=lambda: [str(get_agent_skills_dir())],
+                disabled_skills=self._live_skill_retrieval_disabled_skills,
+                visible_skill_names=scoped_skill_names,
+                source_by_name=lambda: (
+                    skill_sources_from_manager(self._skill_manager)
+                    if self._skill_manager is not None
+                    else {}
+                ),
+                session_scope=self._skill_retrieval_session_scope(),
+                config_base=self._config_base_cache,
+                settings=getattr(self, "_skill_retrieval_settings", None),
+                auto_build_index=True,
+                frozen_profile=getattr(self, "_restored_skill_retrieval_profile", None),
+            )
         self._skill_retrieval_toolkit = toolkit
         self._skill_retrieval_environment = toolkit.environment
         self._persist_skill_retrieval_session_profile()
@@ -8219,7 +8224,7 @@ class JiuWenSwarmDeepAdapter:
             )
             logger.info("[JiuWenSwarmDeepAdapter] current skill_mode: %s", skill_mode)
             skills_dirs = self._skill_scan_dirs()
-            skill_rail = SkillUseRail(
+            skill_rail = ScopedSkillUseRail(
                 skills_dir=skills_dirs,
                 skill_mode=skill_mode,
                 include_tools=include_tools,
@@ -14044,11 +14049,13 @@ class JiuWenSwarmDeepAdapter:
         request: AgentRequest,
         inputs: dict[str, Any],
     ) -> dict[str, Any]:
+        params = request.params if isinstance(request.params, dict) else {}
         apply_scoped_subagent_availability(
             self._instance,
-            request.params if isinstance(request.params, dict) else {},
+            params,
             active_round=getattr(self._instance, "active_round", None) is not None,
         )
+        inputs = with_scoped_skill_run_context(inputs, params)
         if not self._enable_auto_permission:
             return inputs
         root_session_id = self._resolve_interrupt_session_id(request.session_id)
@@ -16007,6 +16014,13 @@ class JiuWenSwarmDeepAdapter:
     def _bind_permission_request_context(self, request: AgentRequest):
         """Bind Host request identity for streaming and non-streaming execution."""
         request_params = request.params if isinstance(request.params, dict) else {}
+        if (
+            self._is_session_scoped_adapter
+            and request_params.get("agent_skills_required")
+            and not isinstance(self._skill_rail, ScopedSkillUseRail)
+        ):
+            raise ValueError("Required Skills need an active Skill rail")
+        skill_tokens = bind_scoped_skills(request_params)
         runtime_mode = str(request_params.get("mode") or "agent").strip().lower()
         root_invocation_token = bind_root_permission_request(
             root_session_id=self._resolve_interrupt_session_id(request.session_id),
@@ -16040,6 +16054,7 @@ class JiuWenSwarmDeepAdapter:
         try:
             yield
         finally:
+            reset_scoped_skills(skill_tokens)
             reset_root_permission_request(root_invocation_token)
             if command_token is not None:
                 reset_command_execution(command_token)

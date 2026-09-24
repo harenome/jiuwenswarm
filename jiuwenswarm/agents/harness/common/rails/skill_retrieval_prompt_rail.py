@@ -26,6 +26,10 @@ from jiuwenswarm.agents.harness.common.tools.skill_retrieval_toolkits import (
     build_discovery_settings,
     is_skill_retrieval_enabled,
 )
+from jiuwenswarm.agents.harness.common.rails.scoped_skill_use_rail import (
+    required_skill_text,
+    scoped_skill_names,
+)
 
 _LEGACY_LIST_SKILL_TOOL_NAMES = frozenset({"list_skill", "list_skills"})
 _SKILL_INDEX_TOOL_NAME = "skill_index"
@@ -197,6 +201,15 @@ class SkillRetrievalPromptRail(DeepAgentRail):
         await self._clear_prompt_attachments(ctx)
         self.system_prompt_builder.remove_section(self.SECTION_NAME)
         self._add_prompt_builder_section(language, candidate_appendix)
+        required = required_skill_text()
+        if required:
+            self.system_prompt_builder.add_section(
+                PromptSection(
+                    name=SectionName.SKILLS,
+                    content={language: required},
+                    priority=self.CANDIDATE_SECTION_PRIORITY + 1,
+                )
+            )
 
     def _add_prompt_builder_section(
         self,
@@ -395,6 +408,8 @@ class SkillRetrievalPromptRail(DeepAgentRail):
         self._hidden_skills_section = None
 
     def _prompt_snapshot(self) -> SkillPromptSnapshot:
+        if scoped_skill_names() is not None and self._prompt_skillfs is not None:
+            return self._prompt_skillfs.prompt_snapshot()
         if self._frozen_prompt_snapshot is None:
             toolkit = self._toolkit()
             self._frozen_prompt_snapshot = (
