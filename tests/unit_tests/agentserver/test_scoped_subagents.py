@@ -101,6 +101,33 @@ def test_empty_and_unknown_names_do_not_enable_an_agent():
     assert "- browser_agent:" not in tool.card.description
 
 
+def test_code_agent_requires_global_registration_and_scope_permission():
+    agent, tool = _agent(names=("research_agent", "code_agent"))
+    apply_scoped_subagent_availability(
+        agent, {"agent_subagents_available": ["research_agent"]}
+    )
+    with pytest.raises(Exception, match="not available through task_tool"):
+        tool._parse_invocation_inputs(
+            {"subagent_type": "code_agent", "task_description": "edit a file"}
+        )
+
+    apply_scoped_subagent_availability(
+        agent, {"agent_subagents_available": ["code_agent"]}
+    )
+    assert tool._parse_invocation_inputs(
+        {"subagent_type": "code_agent", "task_description": "edit a file"}
+    )[0] == "code_agent"
+
+    disabled_agent, disabled_tool = _agent(names=("research_agent",))
+    apply_scoped_subagent_availability(
+        disabled_agent, {"agent_subagents_available": ["code_agent"]}
+    )
+    with pytest.raises(Exception, match="not available through task_tool"):
+        disabled_tool._parse_invocation_inputs(
+            {"subagent_type": "code_agent", "task_description": "edit a file"}
+        )
+
+
 def test_overlapping_request_cannot_widen_active_round():
     agent, tool = _agent()
     apply_scoped_subagent_availability(agent, {"agent_subagents_available": ["research_agent"]})
