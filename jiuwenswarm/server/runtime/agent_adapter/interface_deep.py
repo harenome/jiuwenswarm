@@ -416,6 +416,7 @@ from jiuwenswarm.common.kv_cache_affinity_config import (
 )
 from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import (
     TOOL_PERMISSION_CHANNEL_ID,
+    TOOL_PERMISSION_CHAT_ID,
     TOOL_PERMISSION_REQUEST_ID,
 )
 from jiuwenswarm.server.runtime.session.session_metadata import build_server_push_message
@@ -608,6 +609,9 @@ from jiuwenswarm.common.mcp_config import (
 )
 from jiuwenswarm.server.runtime.mcp.call_timeout_patch import apply_mcp_call_timeout_patch
 from jiuwenswarm.server.runtime.agent_adapter.task_tool_events import apply_task_tool_event_patch
+from jiuwenswarm.server.runtime.agent_adapter.scoped_subagents import (
+    apply_scoped_subagent_availability,
+)
 from jiuwenswarm.common.task_loop_config import (
     resolve_task_loop_completion_timeout,
 )
@@ -14040,6 +14044,11 @@ class JiuWenSwarmDeepAdapter:
         request: AgentRequest,
         inputs: dict[str, Any],
     ) -> dict[str, Any]:
+        apply_scoped_subagent_availability(
+            self._instance,
+            request.params if isinstance(request.params, dict) else {},
+            active_round=getattr(self._instance, "active_round", None) is not None,
+        )
         if not self._enable_auto_permission:
             return inputs
         root_session_id = self._resolve_interrupt_session_id(request.session_id)
@@ -16012,6 +16021,13 @@ class JiuWenSwarmDeepAdapter:
         request_token = TOOL_PERMISSION_REQUEST_ID.set(
             (request.request_id or "").strip()
         )
+        # Bound beside the channel and reset beside it. The request is where the
+        # conversation id is and nothing downstream of here has it, so the tool
+        # call reads it from a ContextVar. See that ContextVar's own comment for
+        # why the scopes permissions section wants the pair.
+        chat_token = TOOL_PERMISSION_CHAT_ID.set(
+            (getattr(request, "chat_id", "") or "").strip()
+        )
         command_token = None
         if self._is_session_scoped_adapter and self._sys_operation is not None:
             command_token = bind_command_execution(
@@ -16027,6 +16043,7 @@ class JiuWenSwarmDeepAdapter:
             reset_root_permission_request(root_invocation_token)
             if command_token is not None:
                 reset_command_execution(command_token)
+            TOOL_PERMISSION_CHAT_ID.reset(chat_token)
             TOOL_PERMISSION_REQUEST_ID.reset(request_token)
             TOOL_PERMISSION_CHANNEL_ID.reset(channel_token)
 

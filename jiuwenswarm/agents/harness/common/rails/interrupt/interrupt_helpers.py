@@ -215,10 +215,15 @@ def build_permission_rail(
         JiuwenSwarmPermissionInterruptRail,
     )
     from jiuwenswarm.agents.harness.common.rails.permissions.permissions_layers import (
+        load_global_permissions,
         load_session_permissions,
         load_user_permissions,
         persist_session_overlay_from_effective,
         persist_user_overlay_from_effective,
+    )
+    from jiuwenswarm.agents.harness.common.rails.permissions.scope_permissions import (
+        narrow_permission_config,
+        scope_refuses,
     )
     from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import (
         SKILLS_REBUILD_SILENT,
@@ -309,12 +314,75 @@ def build_permission_rail(
             sid = (session_id or "").strip()
             return sid or bound_session_id
 
+        def _operator_approval_overrides(session_id: str | None = None) -> list[Any]:
+            """``approval_overrides`` as the operator's own layers hold them."""
+            merged: list[Any] = []
+            for layer in (
+                load_global_permissions(),
+                load_user_permissions(),
+                load_session_permissions(_effective_session_id(session_id)),
+            ):
+                raw = layer.get("approval_overrides") if isinstance(layer, dict) else None
+                if isinstance(raw, list):
+                    merged.extend(raw)
+            return merged
+
+        def _overlay_source(
+            permissions: dict[str, Any], session_id: str | None = None
+        ) -> dict[str, Any]:
+            """The snapshot an overlay may be diffed from: the click, never a scope.
+
+            agent-core merges the user's "always allow" into whatever
+            ``get_permissions_snapshot`` returned and hands the result to the two
+            callbacks below. ``overlay_from_effective`` then records everything that
+            snapshot holds and the operator's own layers do not, so anything a scope
+            did to it would be written into that user's file as their own choice and
+            applied to every conversation they have afterwards.
+
+            Only ``approval_overrides`` has to be put back. The narrowing edits that
+            and ``tools``; ``tools`` is an engine-only key the overlay never reads
+            from the snapshot and ``_merge_overlay_into_current`` strips from the
+            file, while ``approval_overrides`` is pruned of every entry naming a
+            narrowed tool -- the user's own among them, which the write would then
+            delete. The operator's layers are read here rather than the installed
+            snapshot because agent-core installs the merged config before calling
+            back, so by this point the rail's own copy is the narrowed one.
+
+            Fails open, like both entry points: a restoration that cannot be
+            computed leaves the caller with what it was handed.
+            """
+            if not isinstance(permissions, dict):
+                return permissions
+            try:
+                base = _operator_approval_overrides(session_id)
+                merged = permissions.get("approval_overrides")
+                if not isinstance(merged, list):
+                    return permissions
+                known = {
+                    str(item.get("id") or "").strip()
+                    for item in base
+                    if isinstance(item, dict)
+                }
+                added = [
+                    item
+                    for item in merged
+                    if not isinstance(item, dict)
+                    or str(item.get("id") or "").strip() not in known
+                ]
+                return {**permissions, "approval_overrides": [*base, *added]}
+            except Exception as exc:
+                logger.warning(
+                    "[InterruptHelpers] overlay source restore failed: %s", exc
+                )
+                return permissions
+
         def _persist_allow_rule(
             permissions: dict[str, Any], session_id: str | None = None
         ) -> bool:
             try:
                 return persist_user_overlay_from_effective(
-                    permissions, session_id=_effective_session_id(session_id)
+                    _overlay_source(permissions, session_id),
+                    session_id=_effective_session_id(session_id),
                 )
             except Exception as exc:
                 logger.warning("[InterruptHelpers] persist_allow_rule failed: %s", exc)
@@ -328,7 +396,9 @@ def build_permission_rail(
                 logger.warning("[InterruptHelpers] persist_session_allow_rule skipped: no session_id")
                 return False
             try:
-                return persist_session_overlay_from_effective(sid, permissions)
+                return persist_session_overlay_from_effective(
+                    sid, _overlay_source(permissions, sid)
+                )
             except Exception as exc:
                 logger.warning("[InterruptHelpers] persist_session_allow_rule failed: %s", exc)
                 return False
@@ -508,6 +578,35 @@ def build_permission_rail(
             ):
                 return ("approve",)
 
+            # The scopes gate. Why it answers only ``deny`` is in
+            # ``scope_refuses``.
+            #
+            # It sits above both branches below, which approve: a scope can only
+            # tighten, so a deny placed under either would be a restriction the
+            # config states and the code does not honour.
+            #
+            # It sits above the ``perm_ctx is None`` return because
+            # ``setup_permission_context`` builds a PermissionContext only for
+            # the digital-avatar scene or when memory is off. perm_ctx is None
+            # on an ordinary Slack turn, so a branch below that line would never
+            # run for the conversations scopes govern. It reads the two
+            # ContextVars the request handler always sets instead.
+            #
+            # It sits below ask_user because the permission rail swallows an
+            # ask_user answer and re-pops its card forever (issue #1976); a
+            # scope denying ask_user would reopen that, so ask_user is out of
+            # scopes' reach.
+            if scope_refuses(inp.normalized_tool_name):
+                logger.info(
+                    "[InterruptHelpers] scopes deny tool=%s",
+                    inp.normalized_tool_name,
+                )
+                return (
+                    "reject",
+                    "[PERMISSION_DENIED] 该工具在当前会话被 scopes 规则禁用"
+                    " (scopes: deny)",
+                )
+
             if perm_ctx is None:
                 return None
 
@@ -520,7 +619,7 @@ def build_permission_rail(
                     channel_id=str(getattr(perm_ctx, "channel_id", "") or ""),
                     session_id=None,
                     **({
-                        "permission_config": _get_installed_permissions(),
+                        "permission_config": _get_narrowed_permissions(),
                         "use_installed_permissions": True,
                         "installed_engine": getattr(inp, "engine", None),
                     } if enable_auto_permission else {}),
@@ -593,7 +692,52 @@ def build_permission_rail(
                 return installed if isinstance(installed, dict) else {}
             return deepcopy(permission_config)
 
+        def _get_narrowed_permissions(session_id: str | None = None) -> dict[str, Any]:
+            """The installed policy, narrowed by the scopes matching this conversation.
+
+            Where a scopes ``permissions`` section is applied. agent-core's
+            ``narrow_permissions`` is monotone over the ``tools`` field alone, so
+            the sections the engine reads ahead of it have to be edited to match.
+            What has to be edited, and the one case that can only be reported, are
+            in common/scopes/permissions.py.
+
+            Wrapped around ``_get_installed_permissions`` rather than inside it, so
+            that all three paths that function returns on are narrowed at once and
+            the one caller that must *not* see a narrowing, ``_permission_scene_config``,
+            still does not.
+
+            All three paths, because the scopes gate in the scene hook fires
+            whichever of them served the snapshot, and the gate and the snapshot
+            must agree.
+
+            Above the composed path rather than on the global layer feeding it,
+            because ``compose_host_effective_permissions`` promotes every ``tools``
+            level into the ``allow_tools`` / ``ask_tools`` / ``deny_tools`` lists,
+            and those lists are what ``overlay_from_effective`` diffs when a user
+            clicks "always allow". Narrowing before the compose would put a scope's
+            deny into that diff and write it into the user's own overlay, where it
+            would then apply to every conversation they ever have. Narrowing the
+            composed result keeps a scope out of those lists: the engine resolves a
+            tool from ``tools``, and nothing in agent-core reads the three lists.
+
+            ``narrow_permission_config`` hands back the object it was given when no
+            scope matches, so a deployment that has written none pays one lookup.
+            """
+            installed = _get_installed_permissions(session_id)
+            if SKILLS_REBUILD_SILENT.get():
+                # The scene hook approves a silent skills.rebuild above the scopes
+                # gate, and the two may not disagree. That follow-up has no card to
+                # click, so a scope denying it here would stop the rebuild on a
+                # refusal nobody can answer.
+                return installed
+            return narrow_permission_config(installed)
+
         def _permission_scene_config() -> dict[str, Any]:
+            # Left un-narrowed deliberately. Its one caller reads ``owner_scopes``
+            # off the result and nothing else, and ``narrow_config_for_scopes``
+            # edits ``tools`` and ``approval_overrides`` only, so narrowing here
+            # could not change the answer. The gate and the narrowed snapshot still
+            # agree, because neither consults ``owner_scopes``.
             if enable_auto_permission:
                 return _get_installed_permissions()
             current_config = get_config()
@@ -636,7 +780,7 @@ def build_permission_rail(
             return resolve_permission_workspace_dir(bound_session_id)
 
         host = ToolPermissionHost(
-            get_permissions_snapshot=_get_installed_permissions,
+            get_permissions_snapshot=_get_narrowed_permissions,
             persist_allow_rule=_persist_allow_rule,
             persist_session_allow_rule=_persist_session_allow_rule,
             resolve_workspace_dir=_resolve_host_workspace_dir,

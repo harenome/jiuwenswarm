@@ -26,6 +26,17 @@ TOOL_PERMISSION_REQUEST_ID: contextvars.ContextVar[str] = contextvars.ContextVar
     default="",
 )
 
+# 当前 asyncio Task 的 chat_id（会话所在的具体对话，如 Slack 频道 ID）。
+# Set and reset beside TOOL_PERMISSION_CHANNEL_ID by the same call sites: the
+# ``scopes`` permissions section is matched on {channel, chat}. Why that pair is
+# read here and not off the PermissionContext next door is in
+# scope_permissions.py.
+TOOL_PERMISSION_CHAT_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "jiuwenswarm_tool_permission_chat_id",
+    default="",
+)
+
+
 # skills.rebuild 静默 follow-up：无 UI 审批，权限轨需自动放行。
 SKILLS_REBUILD_SILENT: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "jiuwenswarm_skills_rebuild_silent",
@@ -36,5 +47,6 @@ SKILLS_REBUILD_SILENT: contextvars.ContextVar[bool] = contextvars.ContextVar(
 __all__ = [
     "SKILLS_REBUILD_SILENT",
     "TOOL_PERMISSION_CHANNEL_ID",
+    "TOOL_PERMISSION_CHAT_ID",
     "TOOL_PERMISSION_REQUEST_ID",
 ]
