@@ -3728,6 +3728,135 @@ async def test_channel_wechat_set_conf_accepts_valid_numeric(monkeypatch):
     assert cm.configs.get("wechat", {}).get("backoff_max_sec") == 30.0
 
 
+# =====================================================================
+# channel.slack.set_conf — 部分更新合并（设置页只发它认识的键）
+# =====================================================================
+
+
+def _slack_stored_conf() -> dict:
+    """A stored channels.slack the settings page cannot fully express."""
+    return {
+        "enabled": True,
+        "bot_token": "xoxb-flat",
+        "app_token": "xapp-flat",
+        "workspaces": [
+            {"bot_token": "xoxb-one", "app_token": "xapp-one",
+             "default_channel_id": "C0000001"},
+            {"bot_token": "xoxb-two", "app_token": "xapp-two",
+             "default_channel_id": "C0000002"},
+        ],
+        "history": "digest",
+        "enable_streaming": True,
+        "thinking_status": "is thinking",
+    }
+
+
+def _slack_ui_payload(**overrides) -> dict:
+    """Exactly the keys buildSlackFormPayload posts, and no others."""
+    payload = {
+        "enabled": True,
+        "bot_token": "xoxb-typed",
+        "app_token": "xapp-typed",
+        "allow_from": [],
+        "allowed_channel_ids": ["C0000009"],
+        "default_channel_id": "C0000009",
+        "reply_in_thread": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_channel_slack_set_conf_preserves_keys_absent_from_payload(monkeypatch):
+    """设置页保存一次不得删掉它不认识的键（workspaces 及其令牌必须留存）。"""
+    channel = FakeWebChannel()
+    cm = FakeChannelManager()
+    cm.configs["slack"] = _slack_stored_conf()
+    written: list[tuple] = []
+    monkeypatch.setattr(
+        "jiuwenswarm.gateway.channel_manager.web.app_web_handlers.update_channel_in_config",
+        lambda channel_id, conf: written.append((channel_id, dict(conf))),
+    )
+    _register_web_handlers(WebHandlersBindParams(channel=channel, channel_manager=cm))
+
+    await channel.methods["channel.slack.set_conf"](
+        object(), "req-slack", _slack_ui_payload(), "sess-1"
+    )
+
+    assert channel.responses[-1]["ok"] is True
+    stored = cm.configs["slack"]
+    # The second workspace's credentials are still there, unchanged.
+    assert stored["workspaces"] == [
+        {"bot_token": "xoxb-one", "app_token": "xapp-one",
+         "default_channel_id": "C0000001"},
+        {"bot_token": "xoxb-two", "app_token": "xapp-two",
+         "default_channel_id": "C0000002"},
+    ]
+    # So is every other key the form has no field for.
+    assert stored["history"] == "digest"
+    assert stored["enable_streaming"] is True
+    assert stored["thinking_status"] == "is thinking"
+    # The keys the form did send won.
+    assert stored["bot_token"] == "xoxb-typed"
+    assert stored["default_channel_id"] == "C0000009"
+    assert stored["allowed_channel_ids"] == ["C0000009"]
+    # And what is persisted is the merged section, not the payload.
+    assert written and written[0][0] == "slack"
+    assert len(written[0][1]["workspaces"]) == 2
+    assert written[0][1]["history"] == "digest"
+
+
+@pytest.mark.asyncio
+async def test_channel_slack_set_conf_clears_value_the_payload_empties(monkeypatch):
+    """载荷里出现但为空的键是清空，不是没说：合并不得退化成忽略空值。"""
+    channel = FakeWebChannel()
+    cm = FakeChannelManager()
+    cm.configs["slack"] = _slack_stored_conf()
+    monkeypatch.setattr(
+        "jiuwenswarm.gateway.channel_manager.web.app_web_handlers.update_channel_in_config",
+        lambda channel_id, conf: None,
+    )
+    _register_web_handlers(WebHandlersBindParams(channel=channel, channel_manager=cm))
+
+    await channel.methods["channel.slack.set_conf"](
+        object(),
+        "req-slack-clear",
+        _slack_ui_payload(
+            bot_token="", app_token="", default_channel_id="", enabled=False
+        ),
+        "sess-1",
+    )
+
+    assert channel.responses[-1]["ok"] is True
+    stored = cm.configs["slack"]
+    assert stored["bot_token"] == ""
+    assert stored["app_token"] == ""
+    assert stored["default_channel_id"] == ""
+    assert stored["enabled"] is False
+    # Clearing the form did not reach the keys the form never carried.
+    assert len(stored["workspaces"]) == 2
+    assert stored["history"] == "digest"
+
+
+def test_merge_partial_channel_conf_rules():
+    """合并规则本身：出现即生效（含空值），缺席即保留；只合并一层。"""
+    from jiuwenswarm.gateway.channel_manager.web.app_web_handlers import (
+        _merge_partial_channel_conf,
+    )
+
+    stored = {"kept": "yes", "cleared": "old", "replaced": {"a": 1}}
+    merged = _merge_partial_channel_conf(
+        stored, {"cleared": "", "replaced": {"b": 2}, "added": 3}
+    )
+    assert merged == {
+        "kept": "yes", "cleared": "", "replaced": {"b": 2}, "added": 3
+    }
+    # The stored config is not mutated.
+    assert stored == {"kept": "yes", "cleared": "old", "replaced": {"a": 1}}
+    assert _merge_partial_channel_conf(None, {"a": 1}) == {"a": 1}
+    assert _merge_partial_channel_conf({"a": 1}, None) == {"a": 1}
+
+
 def test_update_channel_subsection_in_config_persists_to_disk(tmp_path, monkeypatch):
     """验证 update_channel_subsection_in_config 确实将数据写到 config.yaml 文件。"""
     import yaml

@@ -1,0 +1,204 @@
+# Slack app manifest for JiuwenSwarm -- tier 2, tools.
+#
+# Everything, including the grants behind features that ship off. Install this
+# to decide feature by feature in config rather than by reinstalling the app.
+#
+# GENERATED FILE. Edit jiuwenswarm/common/slack_scope_policy.py and run
+# scripts/generate_slack_manifest.py. A test regenerates this file and fails on
+# any difference, and a second test fails when the code calls a Slack method
+# the policy module does not classify.
+#
+# TO INSTALL: https://api.slack.com/apps -> Create New App -> From a manifest,
+# pick the workspace, paste this file. Two things no manifest field carries
+# stay manual afterwards: an App-Level Token carrying connections:write, minted
+# under Basic Information, and the install itself, which returns the bot token.
+_metadata:
+  major_version: 1
+  minor_version: 1
+
+display_information:
+  name: JiuwenSwarm
+  description: JiuwenSwarm agent runtime, connected over Socket Mode.
+  background_color: "#1f2937"
+  long_description: |-
+    JiuwenSwarm connects an agent runtime to this workspace over Socket Mode, so no public callback URL is needed. It answers mentions and direct messages, streams long replies, and posts questions and approvals as buttons.
+
+    It is installed per workspace from a manifest and configured with a bot token and an app-level token pasted into the operator's own configuration file. It is not distributed, and it is not listed in the Slack Marketplace.
+
+features:
+  bot_user:
+    display_name: JiuwenSwarm
+    always_online: true
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+
+oauth_config:
+  scopes:
+    bot:
+      # tier 0, core
+      - app_mentions:read
+        # needed by app_mention (being addressed in a channel)
+      - channels:history
+        # needed by conversations.history (reading a conversation);
+        # conversations.replies (reading a thread); message.channels (a message
+        # in a public channel)
+      - chat:write
+        # needed by chat.postMessage (posting a reply); chat.update (editing a
+        # reply); chat.delete (withdrawing a message); chat.postEphemeral (a
+        # notice for one reader); chat.startStream (opening a streamed reply);
+        # chat.appendStream (extending a streamed reply); chat.stopStream
+        # (closing a streamed reply); assistant.threads.setStatus (the thread
+        # status line)
+      - groups:history
+        # needed by conversations.history (reading a conversation);
+        # conversations.replies (reading a thread); message.groups (a message
+        # in a private channel)
+        # optional: delete this and message.groups to keep the bot out of
+        #   private channels
+      - im:history
+        # needed by conversations.history (reading a conversation);
+        # conversations.replies (reading a thread); message.im (a direct
+        # message)
+      - mpim:history
+        # needed by conversations.history (reading a conversation);
+        # conversations.replies (reading a thread); message.mpim (a message in
+        # a group direct message)
+        # optional: delete this and message.mpim to keep the bot out of group
+        #   DMs
+      # tier 1, connector
+      - files:read
+        # needed by files.info (resolving an inbound attachment)
+      - files:write
+        # needed by files.upload_v2 (sending a file); files.delete (deleting a
+        # List, which is a file)
+      - reactions:write
+        # needed by reactions.add (the acknowledgement mark); reactions.remove
+        # (clearing the acknowledgement mark)
+      # tier 2, tools
+      - bookmarks:read
+        # needed by bookmarks.list (reading the bookmark bar)
+      - bookmarks:write
+        # needed by bookmarks.add (adding a bookmark); bookmarks.edit (editing
+        # a bookmark); bookmarks.remove (removing a bookmark)
+      - canvases:read
+        # needed by canvases.sections.lookup (listing a canvas's sections)
+      - canvases:write
+        # needed by canvases.create (creating a canvas);
+        # conversations.canvases.create (creating a conversation's own canvas);
+        # canvases.edit (changing what a canvas says); canvases.access.set
+        # (setting who may read or write a canvas); canvases.access.delete
+        # (taking canvas access away); canvases.delete (deleting a canvas)
+      - channels:read
+        # needed by conversations.info (telling one conversation kind from
+        # another); conversations.members (listing who is in a conversation);
+        # conversations.list (finding a conversation by name);
+        # member_joined_channel (somebody joined); member_left_channel
+        # (somebody left)
+      - emoji:read
+        # needed by emoji.list (naming this workspace's custom emoji)
+      - groups:read
+        # needed by conversations.info (telling one conversation kind from
+        # another); conversations.members (listing who is in a conversation);
+        # conversations.list (finding a conversation by name);
+        # member_joined_channel (somebody joined); member_left_channel
+        # (somebody left)
+      - im:read
+        # needed by conversations.info (telling one conversation kind from
+        # another); conversations.members (listing who is in a conversation)
+      - im:write
+        # needed by conversations.open (opening a direct message)
+      - lists:read
+        # needed by slackLists.items.list (reading a List's rows);
+        # slackLists.items.info (reading one row, and the List's schema);
+        # slackLists.download.start (starting an export of a List);
+        # slackLists.download.get (collecting an export of a List)
+      - lists:write
+        # needed by slackLists.create (creating a List); slackLists.update
+        # (renaming a List); slackLists.items.create (adding a row to a List);
+        # slackLists.items.update (writing cells in a List);
+        # slackLists.items.delete (deleting one row of a List);
+        # slackLists.items.deleteMultiple (deleting several rows of a List);
+        # slackLists.access.set (setting who may read or write a List);
+        # slackLists.access.delete (taking List access away)
+      - mpim:read
+        # needed by conversations.info (telling one conversation kind from
+        # another); conversations.members (listing who is in a conversation)
+      - mpim:write
+        # needed by conversations.open (opening a direct message)
+      - pins:read
+        # needed by pins.list (reading what is pinned); pin_added (somebody
+        # pinned); pin_removed (somebody unpinned)
+      - pins:write
+        # needed by pins.add (pinning a message); pins.remove (unpinning a
+        # message)
+      - reactions:read
+        # needed by reaction_added (somebody reacted); reaction_removed
+        # (somebody took a reaction off)
+      - search:read.files
+        # needed by assistant.search.context (searching the workspace)
+        # optional: if Slack refuses this manifest over the six search scopes,
+        #   delete all six and leave channels.slack.search_enabled false
+      - search:read.im
+        # needed by assistant.search.context (searching the workspace)
+      - search:read.mpim
+        # needed by assistant.search.context (searching the workspace)
+      - search:read.private
+        # needed by assistant.search.context (searching the workspace)
+      - search:read.public
+        # needed by assistant.search.context (searching the workspace)
+      - search:read.users
+        # needed by assistant.search.context (searching the workspace)
+      - usergroups:read
+        # needed by usergroups.list (finding a user group by name)
+      - users:read
+        # needed by users.info (turning user ids into names, and under history:
+        # visible deciding whether a member could read a public target
+        # themselves); users.list (finding a person by name)
+
+settings:
+  event_subscriptions:
+    # No request_url: Socket Mode delivers these over the WebSocket the
+    # connector opens with the app-level token.
+    bot_events:
+      - app_mention
+        # being addressed in a channel; needs app_mentions:read
+      - message.channels
+        # a message in a public channel; needs channels:history
+      - message.groups
+        # a message in a private channel; needs groups:history
+      - message.im
+        # a direct message; needs im:history
+      - message.mpim
+        # a message in a group direct message; needs mpim:history
+      - app_home_opened
+        # somebody opened this app's App Home; needs no scope: Slack delivers
+        # it to any app with a bot user
+      - member_joined_channel
+        # somebody joined; needs channels:read, groups:read
+      - member_left_channel
+        # somebody left; needs channels:read, groups:read
+      - pin_added
+        # somebody pinned; needs pins:read
+      - pin_removed
+        # somebody unpinned; needs pins:read
+      - reaction_added
+        # somebody reacted; needs reactions:read
+      - reaction_removed
+        # somebody took a reaction off; needs reactions:read
+
+  interactivity:
+    # The question, approval and stop buttons send block_actions payloads. With
+    # Socket Mode on those arrive on the same WebSocket as the events above, so
+    # no request_url is needed. Turned off, the buttons render and every click
+    # is discarded.
+    is_enabled: true
+
+  socket_mode_enabled: true
+
+  # Not distributed. This app is created per workspace from this manifest and
+  # installed by its own operator; it is not submitted to the Slack Marketplace
+  # and has no OAuth redirect flow.
+  org_deploy_enabled: false
+  token_rotation_enabled: false

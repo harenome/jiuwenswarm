@@ -39,6 +39,11 @@ from jiuwenswarm.common.config import (
     update_xiaoyi_runtime_in_config,
 )
 from jiuwenswarm.symphony import config as symphony_config_module
+from jiuwenswarm.gateway.channel_manager.im_platforms.slack.slack_connect import (
+    render_tables_for_row_threshold,
+    resolve_acknowledge_mode,
+    resolve_render_tables,
+)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -2026,3 +2031,257 @@ channels:
         assert f"push_id: {token}" in text
         assert f"push_id: '{token}'" not in text
         assert f'push_id: "{token}"' not in text
+
+
+_SHIPPED_TEMPLATES = (
+    "config.yaml",
+    "config.team.distributed.leader.yaml",
+    "config.team.distributed.teammate.yaml",
+)
+
+
+class TestTheTemplatesCarryTheKeysTheConnectorReads:
+    """A key the code reads but no template ships is deleted on upgrade.
+
+    ``_deep_merge`` keeps only the keys the template names, so a connector
+    setting missing from the shipped templates is removed from the operator's
+    own file the first time their config is upgraded -- silently, and on a path
+    no Slack test would reach.
+    """
+
+    @pytest.mark.parametrize("template_name", _SHIPPED_TEMPLATES)
+    def test_every_shipped_template_still_carries_group_chat_mode(
+        self, template_name: str
+    ):
+        template = (
+            Path(__file__).resolve().parents[2]
+            / "jiuwenswarm"
+            / "resources"
+            / template_name
+        )
+        slack = yaml.safe_load(template.read_text(encoding="utf-8"))["channels"]["slack"]
+        assert "group_chat_mode" in slack, f"{template_name} dropped group_chat_mode"
+
+
+class TestAcknowledgeRequestsSurvivesMigration:
+    """The compatibility shim needs the key the templates were not shipping.
+
+    ``_deep_merge`` keeps only the keys the template names, so a key absent
+    from the template is deleted from the operator's config the next time one
+    is upgraded. ``acknowledge_requests`` was in that position: the deprecated
+    boolean the connector still reads was being removed from the very file it
+    is read from, leaving the deployment on whatever ``acknowledge_mode``
+    defaults to without saying so.
+    """
+
+    TEMPLATES = _SHIPPED_TEMPLATES
+
+    @staticmethod
+    def _resources() -> Path:
+        return Path(__file__).resolve().parents[2] / "jiuwenswarm" / "resources"
+
+    @staticmethod
+    def _migrate(tmp_path: Path, template_value: str, user_block: str) -> dict:
+        template_path = tmp_path / "template.yaml"
+        user_config_path = tmp_path / "config.yaml"
+        template_path.write_text(
+            "channels:\n"
+            "  slack:\n"
+            "    acknowledge_mode: reaction\n"
+            f"    acknowledge_requests:{template_value}\n",
+            encoding="utf-8",
+        )
+        user_config_path.write_text(
+            "channels:\n  slack:\n" + user_block,
+            encoding="utf-8",
+        )
+        migrate_config_from_template(template_path, user_config_path)
+        return yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
+
+    @pytest.mark.parametrize("user_value", ["true", "false"])
+    def test_a_key_missing_from_the_template_is_deleted_under_pruning(
+        self, tmp_path: Path, user_value: str
+    ):
+        # The behaviour this class was written after, pinned so it cannot come
+        # back by default: with the key absent from the template the operator's
+        # setting does not survive a pruning merge. The default merge is
+        # additive now, so the deletion is exercised where it still exists.
+        template_path = tmp_path / "template.yaml"
+        user_config_path = tmp_path / "config.yaml"
+        template_path.write_text(
+            "channels:\n  slack:\n    acknowledge_mode: reaction\n",
+            encoding="utf-8",
+        )
+        user_config_path.write_text(
+            f"channels:\n  slack:\n    acknowledge_requests: {user_value}\n",
+            encoding="utf-8",
+        )
+        migrate_config_from_template(template_path, user_config_path, prune=True)
+        migrated = yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
+        assert "acknowledge_requests" not in migrated["channels"]["slack"]
+
+    @pytest.mark.parametrize(
+        ("user_value", "expected"), [("true", True), ("false", False)]
+    )
+    def test_a_bare_key_in_the_template_keeps_the_operator_value(
+        self, tmp_path: Path, user_value: str, expected: bool
+    ):
+        migrated = self._migrate(
+            tmp_path, "", f"    acknowledge_requests: {user_value}\n"
+        )
+        assert migrated["channels"]["slack"]["acknowledge_requests"] is expected
+
+    def test_a_bare_key_stays_inert_for_a_config_that_never_set_it(
+        self, tmp_path: Path
+    ):
+        """The value the template hands over must not decide anything.
+
+        Shipping ``false`` would give every deployment an explicit legacy
+        setting, and ``false`` now means ``off``: a config that had neither key
+        would resolve to no acknowledgement at all wherever the mode is unset.
+        A value-less key is read as unset, so the default still stands.
+        """
+        migrated = self._migrate(tmp_path, "", "    reply_in_thread: true\n")
+        slack = migrated["channels"]["slack"]
+        assert slack["acknowledge_requests"] is None
+        assert resolve_acknowledge_mode(slack) == "reaction"
+
+        slack.pop("acknowledge_mode")
+        assert resolve_acknowledge_mode(slack) == "reaction"
+
+    def test_shipping_false_would_decide_for_them(self, tmp_path: Path):
+        # Not a supported configuration -- the guard that says why the shipped
+        # templates write the key bare rather than false.
+        migrated = self._migrate(tmp_path, " false", "    reply_in_thread: true\n")
+        slack = migrated["channels"]["slack"]
+        slack.pop("acknowledge_mode")
+        assert resolve_acknowledge_mode(slack) == "off"
+
+    @pytest.mark.parametrize("name", TEMPLATES)
+    def test_every_shipped_template_writes_the_key_bare(self, name: str):
+        shipped = yaml.safe_load(
+            (self._resources() / name).read_text(encoding="utf-8")
+        )
+        slack = shipped["channels"]["slack"]
+        assert "acknowledge_requests" in slack
+        assert slack["acknowledge_requests"] is None
+        # The mode stays shipped alongside it and keeps winning.
+        assert slack["acknowledge_mode"] == "reaction"
+        assert resolve_acknowledge_mode(slack) == "reaction"
+
+
+class TestRenderTablesReplacesTheRowThreshold:
+    """The retired key has to be read before the template default lands on it.
+
+    ``data_table_row_threshold`` is gone from every template, so the merge
+    writes the template's ``render_tables`` default into a config that has
+    never named it, and the channel's tables change shape in silence. The
+    upgrade translates the threshold first, records the answer as the new key,
+    logs what it did, and removes the retired key itself -- it does not leave
+    that to the merge, which no longer removes anything.
+    """
+
+    TEMPLATES = _SHIPPED_TEMPLATES
+
+    @staticmethod
+    def _resources() -> Path:
+        return Path(__file__).resolve().parents[2] / "jiuwenswarm" / "resources"
+
+    @staticmethod
+    def _migrate(tmp_path: Path, user_block: str) -> dict:
+        template_path = tmp_path / "template.yaml"
+        user_config_path = tmp_path / "config.yaml"
+        template_path.write_text(
+            "channels:\n"
+            "  slack:\n"
+            "    blockkit_tables: auto\n"
+            "    render_tables: data_table\n",
+            encoding="utf-8",
+        )
+        user_config_path.write_text(
+            "channels:\n  slack:\n" + user_block,
+            encoding="utf-8",
+        )
+        migrate_config_from_template(template_path, user_config_path)
+        return yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
+
+    def test_a_zero_threshold_becomes_the_interactive_block(self, tmp_path: Path):
+        """0 already meant "every non-empty table is a data_table", exactly."""
+        migrated = self._migrate(tmp_path, "    data_table_row_threshold: 0\n")
+        slack = migrated["channels"]["slack"]
+        assert slack["render_tables"] == "data_table"
+        assert "data_table_row_threshold" not in slack
+
+    @pytest.mark.parametrize("threshold", [1, 12, 20])
+    def test_any_other_row_count_becomes_the_plain_block(
+        self, tmp_path: Path, threshold: int
+    ):
+        """A positive threshold kept a table plain until it grew past it."""
+        migrated = self._migrate(
+            tmp_path, f"    data_table_row_threshold: {threshold}\n"
+        )
+        slack = migrated["channels"]["slack"]
+        assert slack["render_tables"] == "basic"
+        assert "data_table_row_threshold" not in slack
+
+    def test_an_operator_who_already_chose_is_not_overruled(self, tmp_path: Path):
+        migrated = self._migrate(
+            tmp_path,
+            "    render_tables: off\n    data_table_row_threshold: 0\n",
+        )
+        slack = migrated["channels"]["slack"]
+        # YAML reads the bare word as False; the connector reads it back as off.
+        assert slack["render_tables"] is False
+        assert resolve_render_tables(slack) == "off"
+        # The choice stands, and the retired key still goes: leaving it behind
+        # buys the operator a deprecation warning on every start that nothing
+        # they can write in this file will silence.
+        assert "data_table_row_threshold" not in slack
+
+    @pytest.mark.parametrize("threshold", ["many", "-3", "true"])
+    def test_a_value_that_was_never_a_row_count_leaves_the_default(
+        self, tmp_path: Path, threshold: str
+    ):
+        """These fell back to the module default before and still do."""
+        migrated = self._migrate(
+            tmp_path, f"    data_table_row_threshold: {threshold}\n"
+        )
+        slack = migrated["channels"]["slack"]
+        assert slack["render_tables"] == "data_table"
+        # Expressing no preference is not a reason to keep a retired key.
+        assert "data_table_row_threshold" not in slack
+
+    def test_a_config_without_the_old_key_is_left_alone(self, tmp_path: Path):
+        migrated = self._migrate(tmp_path, "    blockkit_tables: auto\n")
+        assert migrated["channels"]["slack"]["render_tables"] == "data_table"
+
+    def test_the_upgrade_and_the_connector_read_a_threshold_the_same_way(
+        self, tmp_path: Path
+    ):
+        """One rule, written twice: config.py must not import a connector.
+
+        The duplication is deliberate and this is what holds the two copies to
+        the same answer.
+        """
+        for threshold in (0, 1, 12, 20, 5000):
+            migrated = self._migrate(
+                tmp_path, f"    data_table_row_threshold: {threshold}\n"
+            )
+            assert migrated["channels"]["slack"]["render_tables"] == (
+                render_tables_for_row_threshold(threshold)
+            )
+            assert migrated["channels"]["slack"]["render_tables"] == (
+                resolve_render_tables({"data_table_row_threshold": threshold})
+            )
+
+    @pytest.mark.parametrize("name", TEMPLATES)
+    def test_every_shipped_template_names_the_new_key_and_not_the_old(
+        self, name: str
+    ):
+        shipped = yaml.safe_load(
+            (self._resources() / name).read_text(encoding="utf-8")
+        )
+        slack = shipped["channels"]["slack"]
+        assert slack["render_tables"] == "data_table"
+        assert "data_table_row_threshold" not in slack
+        assert resolve_render_tables(slack) == "data_table"

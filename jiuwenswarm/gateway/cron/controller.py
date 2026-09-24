@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from functools import wraps
 
 
@@ -25,6 +26,10 @@ from jiuwenswarm.gateway.cron.models import (
 )
 from jiuwenswarm.gateway.cron.scheduler import CronSchedulerService, _cron_next_push_dt
 from jiuwenswarm.gateway.cron.store_base import CronJobStoreBackend
+from jiuwenswarm.common.slack_routing import (
+    slack_cron_session_is_trusted,
+    warn_if_slack_cron_delivery_unreachable,
+)
 
 
 # 列表/调度等批量路径查询"项目准入"闸门时的最大并发数。
@@ -40,6 +45,33 @@ def _serialize_mutation(method):
             return await method(self, *args, **kwargs)
 
     return serialized
+
+logger = logging.getLogger(__name__)
+
+
+def _warn_if_slack_session_unproven(
+    *,
+    job_session_id: Any,
+    trusted: bool,
+    request_channel_id: Any,
+) -> None:
+    """Say so when a job keeps a Slack-shaped session it cannot prove.
+
+    The job is written either way -- refusing it would break every panel that
+    legitimately edits a Slack job's schedule -- but it silently loses the Slack
+    history tools at run time, which reads as a bug in the tools rather than as
+    the gate doing its job. This log line is the only place that is visible.
+    """
+    if trusted:
+        return
+    if not str(job_session_id or "").strip().startswith("slack_"):
+        return
+    logger.warning(
+        "[Cron] job carries a Slack-shaped session_id that this request cannot "
+        "vouch for (request channel=%r); it will deliver as usual but will not "
+        "be given Slack history access",
+        str(request_channel_id or "") or "<unset>",
+    )
 
 
 class CronController:
@@ -137,7 +169,7 @@ class CronController:
             return normalize_target_channel_id(self._target_channel.value)
         if not is_valid_target_channel_id(raw_s):
             raise ValueError(
-                "targets must be one of tui/web/feishu/dingtalk/whatsapp/wecom/xiaoyi/wechat"
+                "targets must be one of tui/web/feishu/slack/dingtalk/whatsapp/wecom/xiaoyi/wechat"
                 " or feishu_enterprise:<app_id>"
             )
         return normalize_target_channel_id(raw_s)
@@ -228,7 +260,22 @@ class CronController:
         return cron_job_metadata()
 
     @_serialize_mutation
-    async def create_job(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def create_job(
+        self,
+        params: dict[str, Any],
+        *,
+        request_channel_id: str = "",
+        request_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a job, recording whether its Slack session is provable.
+
+        ``request_channel_id`` / ``request_session_id`` describe the request
+        making this call, not the job being made. They default to "unknown",
+        which is what the web and TUI panels are with respect to Slack, and
+        unknown means untrusted: such a job is still created and still delivers
+        wherever its ``session_id`` points, it simply has no Slack context the
+        runtime's history gate will honour.
+        """
         # This marker is set only by the AgentServer-to-Gateway path after the
         # project has been resolved against the user's AgentServer directory.
         # Do not persist it with the job payload.
@@ -245,6 +292,7 @@ class CronController:
         description = str(params.get("description") or "")
         wake_offset_seconds = params.get("wake_offset_seconds", None)
         raw_targets = params.get("targets")
+        post_as_root = bool(params.get("post_as_root", False))
         mode = params.get("mode")
         if mode is not None and str(mode).strip():
             mode = normalize_cron_job_mode(mode)
@@ -262,6 +310,29 @@ class CronController:
         description = self._normalize_description(description, name)
 
         routing_sid = self._routing_session_id(targets, params.get("session_id"))
+        # Computed from the calling request, never read out of ``params``: the
+        # dict holding ``session_id`` is caller-supplied on every RPC path,
+        # so a trust flag inside it would be exactly as forgeable as the string
+        # it claims to vouch for.
+        slack_session_trusted = slack_cron_session_is_trusted(
+            request_channel_id=request_channel_id,
+            request_session_id=request_session_id,
+            job_session_id=routing_sid,
+        )
+        _warn_if_slack_session_unproven(
+            job_session_id=routing_sid,
+            trusted=slack_session_trusted,
+            request_channel_id=request_channel_id,
+        )
+        # The sibling question, answered off the same string: trust decides what
+        # a job may *read*, reachability decides whether it has anywhere to
+        # *write*. A job can be untrusted and still deliverable, or trusted and,
+        # after a session change, undeliverable.
+        warn_if_slack_cron_delivery_unreachable(
+            targets=targets,
+            session_id=routing_sid,
+            job_id=params.get("id"),
+        )
         chat_type = params.get("chat_type")
         delete_after_run = params.get("delete_after_run")
         timeout_seconds = params.get("timeout_seconds")
@@ -332,6 +403,7 @@ class CronController:
             else None,
             description=description,
             targets=targets,
+            post_as_root=post_as_root,
             session_id=routing_sid,
             chat_type=chat_type,
             mode=mode,
@@ -343,16 +415,33 @@ class CronController:
             app_id=app_id,
             work_mode=work_mode,
             user_id=user_id,
+            slack_session_trusted=slack_session_trusted,
         )
         await self._scheduler.reload()
         return job.to_dict()
 
     @_serialize_mutation
-    async def update_job(self, job_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    async def update_job(
+        self,
+        job_id: str,
+        patch: dict[str, Any],
+        *,
+        request_channel_id: str = "",
+        request_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Patch a job, re-deciding Slack trust whenever the session moves.
+
+        A caller-supplied ``slack_session_trusted`` is dropped unread, as in
+        ``create_job``: it would be a way to claim a provenance nobody checked.
+        The store clears the flag on any session change, and the value
+        re-established here -- from the patching request's own channel and
+        session -- is the only one that can put it back.
+        """
         patch = dict(patch or {})
         allow_unresolved_project_id = bool(
             patch.pop("_agentos_project_binding_verified", False)
         )
+        patch.pop("slack_session_trusted", None)
         if "mode" in patch:
             patch["mode"] = normalize_cron_job_mode(patch.get("mode"))
         if "model_name" in patch:
@@ -414,6 +503,38 @@ class CronController:
             patch["session_id"] = self._routing_session_id(
                 final_targets, existing.session_id
             )
+        if "session_id" in patch:
+            new_session_id = patch.get("session_id")
+            if str(new_session_id or "").strip() == str(existing.session_id or "").strip():
+                # The session is being written back unchanged. The store clears
+                # the flag on any session write, so the recorded verdict is
+                # restated rather than re-taken; without this, changing a Slack
+                # job's delivery target from the web panel would silently revoke
+                # its history access.
+                patch["slack_session_trusted"] = bool(existing.slack_session_trusted)
+            else:
+                patch["slack_session_trusted"] = slack_cron_session_is_trusted(
+                    request_channel_id=request_channel_id,
+                    request_session_id=request_session_id,
+                    job_session_id=new_session_id,
+                )
+                _warn_if_slack_session_unproven(
+                    job_session_id=new_session_id,
+                    trusted=bool(patch["slack_session_trusted"]),
+                    request_channel_id=request_channel_id,
+                )
+
+        # Asked on the settled values rather than inside the ``session_id``
+        # branch above, because a targets-only edit -- repointing a job at Slack
+        # from the web panel, which leaves the session untouched -- is exactly
+        # the edit that makes a previously fine job undeliverable.
+        warn_if_slack_cron_delivery_unreachable(
+            targets=final_targets,
+            session_id=patch.get("session_id")
+            if "session_id" in patch
+            else existing.session_id,
+            job_id=job_id,
+        )
 
         if patch.get("enabled") or any(
             key in patch for key in ("project_id", "project_dir")
@@ -652,7 +773,7 @@ class CronController:
                             "type": "string",
                             "enum": [e.value for e in CronTargetChannel],
                             "description": (
-                                "Delivery channel: tui, web, feishu, dingtalk, "
+                                "Delivery channel: tui, web, feishu, slack, dingtalk, "
                                 "whatsapp, wecom, xiaoyi, wechat. "
                                 "If omitted, use the current request source channel."
                             ),
@@ -763,7 +884,8 @@ class CronController:
                                     "type": "string",
                                     "enum": [e.value for e in CronTargetChannel],
                                     "description": (
-                                        "推送频道：web/tui/feishu/dingtalk/whatsapp/wecom/xiaoyi/wechat"
+                                        "推送频道：web/tui/feishu/slack/dingtalk/"
+                                        "whatsapp/wecom/xiaoyi/wechat"
                                     ),
                                 },
                                 "mode": {

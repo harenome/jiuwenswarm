@@ -146,6 +146,8 @@ class _RecordingStore:
             work_mode="work",
             project_id="default",
             user_id=None,
+            session_id=None,
+            slack_session_trusted=False,
         )
 
     async def update_job(self, job_id: str, patch: dict):

@@ -1,0 +1,91 @@
+# Slack app manifest for JiuwenSwarm -- tier 0, core.
+#
+# The smallest app that is a bot at all: it receives a mention or a direct
+# message and answers it.
+#
+# GENERATED FILE. Edit jiuwenswarm/common/slack_scope_policy.py and run
+# scripts/generate_slack_manifest.py. A test regenerates this file and fails on
+# any difference, and a second test fails when the code calls a Slack method
+# the policy module does not classify.
+#
+# TO INSTALL: https://api.slack.com/apps -> Create New App -> From a manifest,
+# pick the workspace, paste this file. Two things no manifest field carries
+# stay manual afterwards: an App-Level Token carrying connections:write, minted
+# under Basic Information, and the install itself, which returns the bot token.
+_metadata:
+  major_version: 1
+  minor_version: 1
+
+display_information:
+  name: JiuwenSwarm
+  description: JiuwenSwarm agent runtime, connected over Socket Mode.
+  background_color: "#1f2937"
+  long_description: |-
+    JiuwenSwarm connects an agent runtime to this workspace over Socket Mode, so no public callback URL is needed. It answers mentions and direct messages, streams long replies, and posts questions and approvals as buttons.
+
+    It is installed per workspace from a manifest and configured with a bot token and an app-level token pasted into the operator's own configuration file. It is not distributed, and it is not listed in the Slack Marketplace.
+
+features:
+  bot_user:
+    display_name: JiuwenSwarm
+    always_online: true
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+
+oauth_config:
+  scopes:
+    bot:
+      # tier 0, core
+      - app_mentions:read
+        # needed by app_mention (being addressed in a channel)
+      - channels:history
+        # needed by message.channels (a message in a public channel)
+      - chat:write
+        # needed by chat.postMessage (posting a reply); chat.update (editing a
+        # reply); chat.delete (withdrawing a message); chat.postEphemeral (a
+        # notice for one reader); chat.startStream (opening a streamed reply);
+        # chat.appendStream (extending a streamed reply); chat.stopStream
+        # (closing a streamed reply)
+      - groups:history
+        # needed by message.groups (a message in a private channel)
+        # optional: delete this and message.groups to keep the bot out of
+        #   private channels
+      - im:history
+        # needed by message.im (a direct message)
+      - mpim:history
+        # needed by message.mpim (a message in a group direct message)
+        # optional: delete this and message.mpim to keep the bot out of group
+        #   DMs
+
+settings:
+  event_subscriptions:
+    # No request_url: Socket Mode delivers these over the WebSocket the
+    # connector opens with the app-level token.
+    bot_events:
+      - app_mention
+        # being addressed in a channel; needs app_mentions:read
+      - message.channels
+        # a message in a public channel; needs channels:history
+      - message.groups
+        # a message in a private channel; needs groups:history
+      - message.im
+        # a direct message; needs im:history
+      - message.mpim
+        # a message in a group direct message; needs mpim:history
+
+  interactivity:
+    # The question, approval and stop buttons send block_actions payloads. With
+    # Socket Mode on those arrive on the same WebSocket as the events above, so
+    # no request_url is needed. Turned off, the buttons render and every click
+    # is discarded.
+    is_enabled: true
+
+  socket_mode_enabled: true
+
+  # Not distributed. This app is created per workspace from this manifest and
+  # installed by its own operator; it is not submitted to the Slack Marketplace
+  # and has no OAuth redirect flow.
+  org_deploy_enabled: false
+  token_rotation_enabled: false

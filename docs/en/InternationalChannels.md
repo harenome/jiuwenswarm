@@ -317,22 +317,39 @@ Discord delivery is separate from model configuration. If you see HTTP errors fr
 
 JiuwenSwarm connects to Slack through the asynchronous Slack Bolt Socket Mode adapter. Socket Mode receives events over WebSocket, so JiuwenSwarm does not need a public HTTP callback URL.
 
-### 1. Create a Slack App
+### 1. Create the Slack app from a manifest
 
-1. Open [Slack API Apps](https://api.slack.com/apps), create an app, and select the target workspace.
-2. Enable **Socket Mode**.
-3. Create an App-Level Token with the `connections:write` scope and save the generated `xapp-...` token.
-4. Under **OAuth & Permissions**, add these Bot Token Scopes:
-   - `chat:write`
-   - `app_mentions:read`
-   - `im:history`
-5. Under **Event Subscriptions**, subscribe to these Bot Events:
-   - `app_mention`
-   - `message.im`
-6. Install the app to the workspace and save the generated `xoxb-...` Bot Token.
-7. Add the bot to every Slack channel where it should respond.
+The app is created by pasting a manifest. Do not tick scopes by hand: the code reaches for twenty-five bot scopes and eleven event subscriptions, and an app missing one of them reports nothing at install — the first sign is a tool refusing with `missing_scope`, or a channel the bot sits silent in. Pasting a manifest is also how a second workspace gets an app that may do exactly what the first one may do.
+
+Three manifests ship, under `jiuwenswarm/resources/slack/`. They differ only in how much the bot is allowed to do, and each is a subset of the next:
+
+| file | bot scopes | what it installs |
+| --- | --- | --- |
+| `slack-app-manifest-0-core.yaml` | 6 | Receives a mention or a direct message and answers it. Nothing else. |
+| `slack-app-manifest-1-connector.yaml` | 9 | Core, plus the acknowledgement reaction and files in both directions. |
+| `slack-app-manifest-2-tools.yaml` | 25 | Everything, including the grants behind features that ship switched off: history digests, pins, bookmarks, the reactions tool, search. |
+
+**Install tier 1 unless there is a reason not to.** Tier 0 suits a deployment that wants the smallest possible grant and accepts that an inbound attachment cannot be read. Tier 2 lets every feature be switched on later in `config.yaml` without going back to Slack.
+
+A missing scope is allowed. Every feature that needs one it does not hold refuses and says which scope it wanted, so a smaller tier is a bot that does less rather than a bot that breaks.
+
+1. Open [Slack API Apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**, select the target workspace, and paste the manifest file.
+2. Under **Basic Information → App-Level Tokens**, create a token with the `connections:write` scope and save the generated `xapp-...` value. No manifest field carries this, so it is always a manual step.
+3. **Install to Workspace**, and save the generated `xoxb-...` Bot Token.
+4. Add the bot to every Slack channel where it should respond. Channel membership is not a scope and no manifest can grant it.
 
 > Treat both `xoxb-...` and `xapp-...` tokens as secrets. Never commit them or print them in logs.
+
+**Changing tier later.** Open the app's **App Manifest** page, paste the higher-numbered file, save, and reinstall. Any scope change takes effect only after a reinstall.
+
+**Narrowing an install by hand.** Two edits are supported, and each is marked `optional:` in the manifest beside the line it applies to:
+
+- Delete `groups:history` together with `message.groups` to keep the bot out of private channels, or `mpim:history` together with `message.mpim` to keep it out of group DMs. Nothing breaks; the bot is simply not reachable there.
+- If Slack refuses the tier 2 manifest, delete the six `search:read.*` lines and leave `channels.slack.search_enabled` at `false`. Those six grant `assistant.search.context`, which may require a workspace plan tier this app cannot check for, and nothing else depends on them.
+
+**What a manifest cannot express**, and what therefore stays manual: the app-level token above, the install itself, and the bot's channel membership. Everything else is in the file — every bot scope, every event subscription, Socket Mode, and interactivity for the question, approval and stop buttons.
+
+The manifests are generated rather than written. `jiuwenswarm/common/slack_scope_policy.py` records which Slack call or event needs each scope, and a test fails when the code calls something that module does not classify, or when a committed manifest is stale. A scope added to an app by hand must be added there too, or the next regeneration will not know about it.
 
 ### 2. Configure JiuwenSwarm
 
@@ -347,8 +364,15 @@ channels:
     app_token: "xapp-your-app-token"
     allow_from: []
     allowed_channel_ids: []
+    history_digest_channel_ids: []  # Use ["*"] for all accessible conversations.
     default_channel_id:
     reply_in_thread: true
+    group_chat_mode: mention          # mention | reply | all | off
+    acknowledge_mode: reaction        # reaction | text | both | off
+    acknowledgement_text: "Received. Analyzing…"
+    acknowledgement_emoji: eyes
+    rejected_emoji: no_entry_sign
+    enable_streaming: false
     enabled: true
 ```
 
@@ -358,14 +382,147 @@ channels:
 | `app_token` | Required Socket Mode App Token in `xapp-...` format | empty |
 | `allow_from` | Allow-list of Slack user IDs; empty allows all users | `[]` |
 | `allowed_channel_ids` | Channel IDs allowed to mention the bot; empty allows all channels and does not restrict DMs | `[]` |
+| `history_digest_channel_ids` | Conversation IDs allowed to expose bulk history to the digest tool; `['*']` allows every conversation the bot can access, while empty disables channel digests | `[]` |
 | `default_channel_id` | Fallback channel for outbound messages without request context | empty |
 | `reply_in_thread` | Reply in the thread containing the triggering channel message | `true` |
+| `group_chat_mode` | What the bot reads in channels: `mention`, `reply`, `all`, or `off`. Direct messages are never affected | `mention` |
+| `acknowledge_mode` | How to confirm an accepted request before agent processing: `reaction`, `text`, `both`, or `off` | `reaction` |
+| `acknowledgement_text` | Text used when the mode includes `text` | `Received. Analyzing…` |
+| `acknowledgement_emoji` | Emoji name added to accepted requests, without colons | `eyes` |
+| `rejected_emoji` | Emoji name added when `allow_from` refuses a request | `no_entry_sign` |
+| `enable_streaming` | Show the reply as it is written, by editing one message about once a second | `false` |
 | `enabled` | Enable the Slack channel | `false` |
 
 ### 3. Use the Bot
 
 - In a channel, send `@bot your message`. JiuwenSwarm processes it and replies in the message thread by default.
+
+#### Channel reading modes
+
+`group_chat_mode` decides how much of a channel the bot reads. The modes are
+cumulative, so raising the level only adds traffic:
+
+| Mode | The bot answers |
+|:-----|:----------------|
+| `mention` | `@bot` mentions (default) |
+| `reply` | the above, plus thread replies posted under one of the bot's own messages |
+| `all` | the above, plus every other message in allowed channels |
+| `off` | nothing in channels, not even mentions |
+
+This differs from Telegram's field of the same name, where the modes are
+mutually exclusive. Slack delivers mentions through a separate `app_mention`
+subscription, so `reply` and `all` keep answering mentions rather than
+replacing them; only `off` silences them.
+
+`allowed_channel_ids` still applies, so `all` reads every message in the
+channels you listed rather than the whole workspace. `reply` needs the bot's own
+user ID, which comes from `auth.test` at startup; if that call fails the mode
+answers nothing rather than guessing.
 - Send the bot a direct message without mentioning it.
+- Add the current conversation ID to `history_digest_channel_ids`, or configure `['*']` to opt in every Slack conversation the bot can access, then ask for a high-signal digest of the current channel and all of its thread replies, for example:
+
+  ```text
+  @JiuwenSwarm Summarize the decisions, technical findings, blockers, action items, and useful links from this channel over the past 7 days. Include all thread replies and cite the source messages.
+  ```
+
+  For all accessible history:
+
+  ```text
+  @JiuwenSwarm Review all accessible history in this channel, including all thread replies. Organize the high-signal information and distinguish facts, inferences, and recommendations.
+  ```
+
+  The bot always derives the current channel from the request and returns the digest in that request's thread. It never accepts a channel ID from the prompt. "All" means history still retained by Slack that the bot can access, subject to built-in message, API, size, and 90-second scan limits. The digest reports partial coverage when retention, permissions, limits, or API failures prevent a complete scan. The bot must be a member of the channel. The digest reads history through the history toolkit, which the tier 2 manifest grants; private channels additionally require `groups:history`, which every tier grants unless it was deleted by hand.
+
+  Channel history selected for the digest is sent to the configured model provider. Only add conversations whose members and data policies permit that processing. The explicit `['*']` wildcard opts in every conversation the bot can access; an empty `history_digest_channel_ids` list keeps bulk history access disabled.
+- `group_chat_mode` is the connector-wide default. To give one conversation a different set of triggers, a standing prompt, or its own model, write a rule for it in the top-level `scopes:` list. A rule can also name who is asking — `user: ["U0…"]` for the senders it applies to, or `not: {user: ["U0…"]}` for everyone in the conversation except them — so one person can be given a different prompt, or everyone but them a narrower trigger set. The shipped `config.yaml` documents the block, including the five trigger names — `mention`, `reply`, `all`, `url`, `has_file` — and a worked example.
+- A conversation whose triggers include `url` processes member messages containing an HTTP/HTTPS link without a mention, and replies in a thread; plain text is still ignored. A conversation a scope names is opted in by that alone and is exempt from `allowed_channel_ids`.
+- A link-triggered message holds the URL, not the page behind it. A `delivery.prompt` that asks for analysis without asking for the link to be fetched requests work on material nothing has retrieved, and tools that take a local path rather than a URL are then given a filename invented to fit. Begin the instructions with fetching the link.
+- Accepted mentions, direct messages, and automatic links are confirmed before agent processing begins. The default `reaction` mode adds `acknowledgement_emoji` to the request itself, which is far quieter in a shared channel than an extra message; `text` posts `acknowledgement_text` instead, `both` does both, and `off` disables confirmation. Requests refused by `allow_from` get `rejected_emoji`, while a channel excluded by `allowed_channel_ids` is ignored silently.
+- Reactions require the `reactions:write` scope, granted by tier 1 and above. If it is missing, the failure is logged once per message and the request is still handled. The deprecated `acknowledge_requests` boolean is still honoured when `acknowledge_mode` is absent: `true` maps to `text`, `false` to `off`, matching the single text acknowledgement it switched on and off before the mode existed. Setting `acknowledge_mode` decides on its own, so a config holding both keys never reads the boolean; the boolean written with no value after the colon is read as unset and leaves the default in place.
+- With `enable_streaming: true` the bot posts as soon as the first text arrives and edits that message about once a second until the reply is complete, which is also the rate Slack meters message operations at per channel. Edits are best effort: one that fails costs a moment of staleness, and the completed reply always replaces the whole text. A reply too long for one message keeps its first part in the streamed message and posts the rest afterwards. Editing requires no scope beyond the `chat:write` the bot already uses to reply.
+- When a reply needs a decision — a tool asking for permission, a confirmation, an approval — the bot posts the question with one button per choice and resumes the paused work as soon as one is pressed. The message is then rewritten without its buttons, keeping the question and recording the choice and who made it, so the same question cannot be answered twice. Questions arrive only on a streamed turn, so this needs `enable_streaming: true`. Buttons need no scope beyond `chat:write`, and no Request URL: with Socket Mode enabled, interactivity is on and button clicks arrive over the same WebSocket as events. Only questions offering a choice are posted; one asking for free-form text is logged and skipped, because a typed Slack reply cannot be routed back to the work waiting on it.
+- Cron jobs created from Slack use `targets: slack` by default and return results
+  to the originating channel or thread. Jobs without Slack request context use
+  `default_channel_id`. Set `post_as_root: true` (or `delivery.post_as_root: true`
+  through the unified cron interface) to publish each scheduled result as a new
+  top-level channel message instead of a threaded reply.
+- Long Slack-native reports can place
+  `<!-- jiuwenswarm:slack-thread-details -->` between a short brief and detailed
+  evidence. JiuwenSwarm posts the brief as a top-level message and the detail in
+  that brief's own thread. Every marker is a message boundary, so a report
+  holding several of them arrives as the brief plus one threaded reply per
+  section, in the order they were written — which also gives each section its own
+  Block Kit budget, since those limits are counted per message. A section that
+  renders to nothing is skipped rather than posted empty, and a marker with
+  nothing above or below it is stripped and the reply posted as a single message.
+  Without the marker, paragraph-aware splitting keeps links and list items intact
+  where possible.
+- A Markdown table in a reply is posted as a Block Kit table instead of as
+  preformatted text. Slack mrkdwn has no table syntax, so this is the only
+  formatting Block Kit adds: headings, bold, bullets, links and code fences
+  already render correctly and are left as mrkdwn. `blockkit_tables` controls the
+  policy — `auto` (default) renders any Markdown table and accepts
+  `<!-- jiuwenswarm:slack-blocks:off -->` as a per-message opt-out, `marker`
+  renders only when the reply itself includes
+  `<!-- jiuwenswarm:slack-blocks -->`, and `off` disables it while still
+  stripping both markers. Note that `marker` does nothing on its own:
+  JiuwenSwarm never tells the model that marker exists, so the mode is only
+  useful if you introduce it yourself from a skill or a system prompt. Block
+  Kit's limits cannot be split across messages the way text can, so a reply too
+  large for them is posted as text unchanged. Streamed replies stay text-only
+  while they are being written; the table appears in the completed message. No
+  scope beyond `chat:write` is required.
+- `render_tables` decides which of Slack's two table blocks a table becomes.
+  `data_table` (the default) pages, sorts, filters and offers the reader a
+  download, and holds 200 rows and 20,000 characters; `basic` is a plain table
+  with every row on screen at once, none of those controls and half the budget;
+  `off` leaves the table as the text it was written as. `off` is about tables
+  only — a chart or a hand-written ` ```blockkit ` fence in the same reply still
+  renders, and `blockkit_tables: off` is what suppresses those. A table shorter
+  than one page shows whole under `data_table`, with no pager, so the
+  interactive block costs a short table nothing. This key replaces
+  `data_table_row_threshold`, which chose between the two blocks by counting
+  rows: the blocks differ in what a reader can do with a table rather than in
+  how big it is, so a row count could only ever pick between them by accident. A
+  config upgrade rewrites the old key — `0` becomes `data_table`, any other row
+  count becomes `basic` — and says so in the log.
+- A reply can also draw a diagram or a chart, or hand over Block Kit JSON it
+  wrote itself. Five fences decide that and nothing else does: ` ```mermaid ` is
+  drawn as a diagram, ` ```vega-lite ` is drawn as a chart, ` ```blockkit ` is
+  drawn as the blocks its JSON describes, and both ` ```slack-raw ` and an
+  unnamed fence are never drawn and are shown as the source they hold. Naming
+  the language is the whole request — there is no marker to add beside it. The
+  reply marker `<!-- jiuwenswarm:slack-blocks -->` no longer turns a fence on;
+  it decides table shape. Blocks can still be turned off wholesale, and that
+  reaches fences too: `blockkit_tables: off`, `blockkit_tables: marker` without
+  the marker, and a reply's own `<!-- jiuwenswarm:slack-blocks:off -->` each
+  suppress every block in the reply.
+- Slack draws four chart types — pie, bar, area and line — and four sources
+  reach them. mermaid's `pie` becomes a pie; mermaid's `xychart-beta` becomes a
+  bar or line chart; a ` ```vega-lite ` spec becomes any of the four; and a
+  ` ```blockkit ` fence writes one out by hand. mermaid has no area chart of any
+  kind, so an area chart comes from `vega-lite` or `blockkit` or not at all.
+  ` ```mermaid ` and ` ```vega-lite ` are the portable pair: a renderer that has
+  never heard of Slack still knows both languages. Vega-Lite is much larger than
+  what Slack draws, so only the part that maps exactly is translated — an
+  unsupported `mark`, an external `data.url`, a layered or faceted spec, and an
+  aggregate all leave the fence undrawn and visible as the spec that was
+  written, rather than being approximated by the nearest chart Slack has.
+  `xychart-beta` is beta and its syntax has moved between mermaid releases; that
+  is survivable here because every parser declines a shape it does not recognise
+  instead of guessing, so a future change leaves a fence undrawn rather than
+  drawing the wrong chart.
+- `blockkit_allowed_block_types` restricts which block types such a fence may
+  hold. Empty (the default) restricts nothing, because which types Slack draws
+  is Slack's to say and changes without JiuwenSwarm hearing about it. Name types
+  to narrow it, e.g. `[data_table, data_visualization]`.
+- `blockkit_allow_interactive` (default `false`) decides separately whether such
+  a fence may hold buttons, selects and other elements that post back to the
+  app. It is a separate key on purpose: JiuwenSwarm posts real
+  permission-approval buttons into these same channels, and a reader cannot tell
+  a button a reply drew from a button the approval flow drew. Widening which
+  block types may be drawn therefore never widens what a reader can be asked to
+  click.
 - Channel conversations are isolated by Slack thread, so separate threads do not share a JiuwenSwarm session.
 - The current integration sends final text replies and suppresses token-level `chat.delta` events to avoid channel noise and Slack rate limits.
 
@@ -388,8 +545,33 @@ Slack user IDs and channel IDs are available from the member profile and channel
 
 **Direct messages get no reply**
 
-- Confirm the app has `im:history` and subscribes to `message.im`.
+- Confirm the app was created from a shipped manifest: every tier grants `im:history` and subscribes to `message.im`.
 - Reinstall the app to the workspace after changing scopes or event subscriptions.
+
+**Links in an automatic channel do not trigger the bot**
+
+- Confirm a scope names the conversation with `url` among its `delivery.mode` triggers, and that the bot is a member of the channel.
+- Confirm the app was created from a shipped manifest: every tier grants `channels:history` and subscribes to `message.channels`.
+- Confirm the message is from a human, contains an HTTP/HTTPS link, and the sender passes `allow_from`.
+- Reinstall the app after changing scopes or event subscriptions.
+
+**A channel digest is empty, shows user IDs, or reports partial coverage**
+
+- Confirm the bot is a member of the channel, and that the app was installed from the tier 2 manifest — the digest reads history, names and membership, which the lower tiers do not grant.
+- Confirm the current conversation ID is listed in `history_digest_channel_ids`, or use `['*']` to allow every conversation the bot can access; an empty list disables this capability.
+- Member names shown as raw `U…` ids mean `users:read` is absent: install the tier 2 manifest and reinstall the app. The digest degrades to ids rather than failing, and says so in its coverage note.
+- Slack retention settings and JiuwenSwarm safety limits can make an all-history result partial; check the coverage note in the digest.
+- A channel digest only reads the channel where the request was made. It does not use a channel ID supplied in the prompt.
+
+**A Slack cron job does not deliver its result**
+
+- Confirm the job's `targets` value is `slack`.
+- Confirm the bot belongs to the Slack channel captured in the job's
+  `session_id`. `default_channel_id` is only the fallback when no request
+  context is available.
+- Confirm the bot is a member of the destination channel and has `chat:write`.
+- To keep recurring reports out of the source thread, update the job with
+  `post_as_root: true`.
 
 ---
 

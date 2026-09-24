@@ -32,6 +32,7 @@ class CronJobStoreBackend(Protocol):
         timezone: str,
         description: str,
         targets: str,
+        post_as_root: bool = False,
         enabled: bool = True,
         wake_offset_seconds: int | None = None,
         session_id: str | None = None,
@@ -44,6 +45,7 @@ class CronJobStoreBackend(Protocol):
         app_id: str = "",
         work_mode: str = "work",
         user_id: str = "",
+        slack_session_trusted: bool = False,
     ) -> CronJob:
         ...
 

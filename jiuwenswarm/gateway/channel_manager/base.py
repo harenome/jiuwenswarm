@@ -2,6 +2,7 @@
 
 import logging
 import asyncio
+import dataclasses
 import inspect
 import time
 from abc import ABC, abstractmethod
@@ -10,6 +11,7 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
+from jiuwenswarm.common.interrupt_prompt import render_prompt_as_text
 from jiuwenswarm.common.schema.message import Message
 from jiuwenswarm.gateway.routing.session_sharing import RoutingTarget
 
@@ -126,6 +128,13 @@ class BaseChannel(ABC):
 
     name: str = "base"
 
+    # 该 Channel 的 send() 能否把 chat.ask_user_question 渲染成用户可作答的形式
+    # （交互卡片、结构化 payload 等）。默认 False：多数 IM Channel 的 send() 只取
+    # payload["content"]，审批 payload 没有该字段，消息会被静默丢弃——用户看不到
+    # 任何东西，却仍在等他作答。置 False 的 Channel 由 outgoing_for_channel()
+    # 换成纯文本，至少让人知道有东西在等。
+    renders_interactive_prompts: bool = False
+
     def __init__(self, config: Any, router: RobotMessageRouter):
         """
         初始化Channel
@@ -217,6 +226,9 @@ class BaseChannel(ABC):
 
 class BaseWebChannel(BaseChannel):
 
+    # Web / TUI / CLI 前端拿到的是完整 payload，审批提示由前端自己渲染。
+    renders_interactive_prompts = True
+
     def __init__(self, config: Any, router: RobotMessageRouter):
         """
         初始化Channel
@@ -269,3 +281,31 @@ class BaseWebChannel(BaseChannel):
 
         return status, headers, _UNAUTHORIZED_BODY
 
+
+def outgoing_for_channel(channel: BaseChannel, msg: Message) -> Message:
+    """把 Channel 渲染不了的审批提示换成纯文本，其余原样返回。
+
+    渲染不了就丢弃，等于让人对着一个他从未看见的提示等下去；退化成文本至少让
+    等待是可见的。
+    """
+    from jiuwenswarm.common.schema.message import EventType
+
+    if msg.event_type != EventType.CHAT_ASK_USER_QUESTION:
+        return msg
+    if getattr(channel, "renders_interactive_prompts", False):
+        return msg
+    payload = msg.payload if isinstance(msg.payload, dict) else {}
+    text = render_prompt_as_text(payload)
+    if not text:
+        return msg
+
+    logger.info(
+        "[%s] chat.ask_user_question 无法渲染，降级为文本: id=%s",
+        getattr(channel, "channel_id", getattr(channel, "name", "unknown")),
+        getattr(msg, "id", ""),
+    )
+    return dataclasses.replace(
+        msg,
+        event_type=EventType.CHAT_FINAL,
+        payload={"event_type": EventType.CHAT_FINAL.value, "content": text},
+    )

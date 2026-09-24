@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import uuid as uuid_module
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse
@@ -1886,6 +1887,28 @@ async def _run(
         or (str(cfg_target) if cfg_target is not None else "web")
     )
 
+    # ``relay_channel_id`` names a connector, not a conversation, so a heartbeat
+    # aimed at Slack has only ``channels.slack.default_channel_id`` to land in.
+    # Checked here, where the two values are settled together, rather than left
+    # to surface as a SlackDeliveryError once per interval forever.
+    #
+    # The connector module is imported under the same condition
+    # ``warn_if_heartbeat_relay_unreachable`` itself returns early on, so that a
+    # deployment whose heartbeat goes anywhere else does not read it at all --
+    # the lazy-import rule this function opens with. Repeating the condition
+    # here is the price of that; the helper still decides, and both sides read
+    # the same word.
+    if str(heartbeat_relay_channel or "").strip().lower() == "slack":
+        from jiuwenswarm.gateway.channel_manager.im_platforms.slack.slack_connect import (
+            slack_default_channel_id_from_config,
+            warn_if_heartbeat_relay_unreachable,
+        )
+
+        warn_if_heartbeat_relay_unreachable(
+            heartbeat_target=heartbeat_relay_channel,
+            default_channel_id=slack_default_channel_id_from_config(full_cfg),
+        )
+
     heartbeat_config = HealthCheckConfig(
         interval_seconds=heartbeat_interval,
         timeout_seconds=heartbeat_timeout,
@@ -2481,6 +2504,19 @@ async def _run(
             xiaoyi_raw = conf.get("xiaoyi")
             if isinstance(xiaoyi_raw, dict):
                 conf["xiaoyi"] = _normalize_xiaoyi_conf(xiaoyi_raw)
+            # channels.slack is read in either shape and handed on as the list
+            # shape, so the branch below is one loop rather than a loop with the
+            # single mapping special-cased beside it. Normalised here, before
+            # _should_restart_channel compares the snapshots, so that a config
+            # rewritten from one shape into the other with the same credentials
+            # is seen as unchanged and does not drop every live connection.
+            slack_raw = conf.get("slack")
+            if isinstance(slack_raw, dict):
+                from jiuwenswarm.gateway.channel_manager.im_platforms.slack.slack_connect import (
+                    normalize_slack_conf,
+                )
+
+                conf["slack"] = normalize_slack_conf(slack_raw)
         # ==========================================================
 
         restart_pending = channel_manager.pop_channel_restart_pending()
@@ -2805,35 +2841,372 @@ async def _run(
 
         if "slack" in changed_channels:
             slack_conf = conf.get("slack") if isinstance(conf, dict) else None
-            await _stop_channel(slack_channel, slack_task, "slack")
+            # One channel per workspace, so one stop per registered instance.
+            # Popped before stopping: _stop_channel unregisters by channel_id,
+            # which drops every Slack key at once, and a later lookup of a key
+            # already removed that way would raise.
+            for _old_slack in channel_manager.pop_channels_by_id("slack"):
+                await _stop_channel(
+                    _old_slack,
+                    getattr(_old_slack, "start_task", None),
+                    f"slack[{_old_slack.app_id}]",
+                )
+            # Kept only for the nonlocal declaration; neither is the handle on
+            # anything once there can be more than one instance.
             slack_channel, slack_task = None, None
+            # Drop any adapter the previous incarnation registered, so turning
+            # group_digital_avatar off in the config actually takes effect on a
+            # hot reload instead of leaving the old one wired up. One adapter
+            # for the connector, registered under "slack" and shared by every
+            # workspace, exactly as the Feishu apps loop shares "feishu".
+            im_inbound.unregister_adapter("slack")
+            im_outbound.unregister_adapter("slack")
 
             if isinstance(slack_conf, dict):
-                enabled, reason = _is_channel_enabled(slack_conf, ["bot_token", "app_token"])
-                if not enabled:
-                    logger.info("[App] channels.slack.%s, SlackChannel disabled", reason)
+                from jiuwenswarm.gateway.channel_manager.im_platforms.slack.slack_connect import (
+                    DEFAULT_THINKING_STATUS,
+                    SLACK_WORKSPACES_KEY,
+                    apply_scopes_to_slack_overrides,
+                    describe_configured_channels,
+                    describe_slack_delivery_reachability,
+                    load_slack_scopes,
+                    resolve_acknowledge_mode,
+                    resolve_app_messages,
+                    resolve_app_messages_from,
+                    resolve_blockkit_allow_interactive,
+                    resolve_blockkit_allowed_block_types,
+                    resolve_blockkit_tables_mode,
+                    resolve_blockkit_validate,
+                    resolve_group_chat_mode,
+                    resolve_reaction_emoji,
+                    resolve_render_tables,
+                    resolve_sdk_log_level,
+                    resolve_streaming_enabled,
+                )
+                from jiuwenswarm.common.slack_history_policy import (
+                    resolve_history_exempt_members,
+                    resolve_history_never_read,
+                    resolve_history_policy,
+                )
+                from jiuwenswarm.common.slack_write_policy import resolve_write_policy
+
+                # Which blocks are to be connected, settled before anything
+                # else is resolved: a deployment with Slack off must not pay for
+                # scope compilation or write the startup summaries.
+                #
+                # The position in the configured list is carried alongside each
+                # block, so that disabling one workspace does not renumber the
+                # ones beside it.
+                all_slack_blocks = list(slack_conf.get(SLACK_WORKSPACES_KEY) or [])
+                connector_enabled = slack_conf.get("enabled", None)
+                slack_blocks: list[tuple[int, dict]] = []
+                if connector_enabled is not None and not bool(connector_enabled):
+                    logger.info(
+                        "[App] channels.slack.enabled = false, SlackChannel disabled"
+                    )
                 else:
                     from jiuwenswarm.gateway.channel_manager.im_platforms.slack.slack_connect import \
                         SlackChannel, SlackChannelConfig
+                    for block_index, block in enumerate(all_slack_blocks):
+                        block_on, block_reason = _is_channel_enabled(
+                            block, ["bot_token", "app_token"]
+                        )
+                        if not block_on:
+                            logger.info(
+                                "[App] channels.slack.workspaces[%d].%s, skipping",
+                                block_index,
+                                block_reason,
+                            )
+                            continue
+                        slack_blocks.append((block_index, block))
+                if slack_blocks:
                     reply_in_thread_raw = slack_conf.get("reply_in_thread", True)
                     reply_in_thread = (
                         str(reply_in_thread_raw).strip().lower() in ("true", "1", "yes", "on")
                         if isinstance(reply_in_thread_raw, str)
                         else bool(reply_in_thread_raw)
                     )
+                    enable_streaming = resolve_streaming_enabled(
+                        slack_conf.get("enable_streaming")
+                    )
+                    blockkit_tables = resolve_blockkit_tables_mode(slack_conf)
+                    render_tables = resolve_render_tables(slack_conf)
+                    blockkit_allowed_block_types = (
+                        resolve_blockkit_allowed_block_types(slack_conf)
+                    )
+                    blockkit_validate = resolve_blockkit_validate(slack_conf)
+                    blockkit_allow_interactive = resolve_blockkit_allow_interactive(
+                        slack_conf
+                    )
+                    acknowledge_mode = resolve_acknowledge_mode(slack_conf)
+                    # Per-conversation behaviour comes from the top-level
+                    # scopes: list and nothing else. A config with no scopes
+                    # written settles to an empty map, which is the connector
+                    # following channels.slack alone.
+                    #
+                    # Two sections are settled here. delivery gives the
+                    # connector mode, prompt, mid_turn and session, which it
+                    # acts on itself; agent gives it model_name and history,
+                    # which it only carries onto the request for the runtime to
+                    # act on. All six land in the same SlackChannelOverride
+                    # carrier, because settled_override is the one place that
+                    # decides which layer won for any of them.
+                    slack_scopes = load_slack_scopes()
+                    platform_override, conversation_overrides = (
+                        apply_scopes_to_slack_overrides(
+                            slack_conf, scopes=slack_scopes
+                        )
+                    )
+
+                    def _slack_seconds(key: str, default: float) -> float:
+                        """A non-negative number of seconds, or the default.
+
+                        A mistyped value falls back rather than raising, and a
+                        negative one is read as zero -- the existing meaning of
+                        "no delay" and "no floor".
+                        """
+                        raw = slack_conf.get(key)
+                        if raw is None or isinstance(raw, bool):
+                            return default
+                        try:
+                            value = float(raw)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "[App] channels.slack.%s is not a number (%r);"
+                                " using %s",
+                                key, raw, default,
+                            )
+                            return default
+                        return max(0.0, value)
+
+                    # The pre-rename key names are still read, second, so an
+                    # operator who tuned either knob does not have that setting
+                    # quietly ignored.
+                    activity_card_delay = _slack_seconds(
+                        "activity_card_delay_seconds",
+                        _slack_seconds("subagent_card_delay_seconds", 5.0),
+                    )
+                    activity_card_min_edit = _slack_seconds(
+                        "activity_card_min_edit_seconds",
+                        _slack_seconds("subagent_card_min_edit_seconds", 10.0),
+                    )
+                    # The connector-wide half, built once and shared by every
+                    # workspace. The three per-workspace fields are left empty
+                    # here and filled in per block below: a block holds
+                    # credentials and the conversation a producer falls back to,
+                    # and nothing else is per workspace.
                     slack_config = SlackChannelConfig(
                         enabled=True,
-                        bot_token=str(slack_conf.get("bot_token") or "").strip(),
-                        app_token=str(slack_conf.get("app_token") or "").strip(),
+                        bot_token="",
+                        app_token="",
                         allow_from=slack_conf.get("allow_from") or [],
                         allowed_channel_ids=slack_conf.get("allowed_channel_ids") or [],
-                        default_channel_id=str(slack_conf.get("default_channel_id") or "").strip(),
+                        # Whose app-posted messages are read at all, and the
+                        # ids the middle word admits. Absent, the word is
+                        # "none", which is every app dropped, as before. The
+                        # list is carried whatever the word is and read only
+                        # under "listed".
+                        app_messages=resolve_app_messages(slack_conf),
+                        app_messages_from=resolve_app_messages_from(slack_conf),
+                        # Settled here so that the connector, the cron
+                        # scheduler and the runtime all read the same answer for
+                        # one conversation. The resolver translates the
+                        # deprecated history_digest_channel_ids, warning once
+                        # per distinct translation.
+                        history=resolve_history_policy(slack_conf),
+                        history_never_read=resolve_history_never_read(slack_conf),
+                        history_exempt_members=resolve_history_exempt_members(
+                            slack_conf
+                        ),
+                        # The posting ladder, settled here for the same reason
+                        # the reading one is: the connector and the cron
+                        # scheduler must read one answer rather than each
+                        # reading the key for themselves.
+                        write=resolve_write_policy(slack_conf),
+                        conversation_overrides=conversation_overrides,
+                        platform_override=platform_override,
+                        # The compiled rules as well as what they settled. A
+                        # rule naming a sender cannot be settled here -- there
+                        # is no sender at config time -- so the connector keeps
+                        # them and folds again when a message arrives. With no
+                        # such rule written it never does.
+                        scopes=slack_scopes,
+                        default_channel_id="",
                         reply_in_thread=reply_in_thread,
+                        group_chat_mode=(
+                            resolve_group_chat_mode(
+                                slack_conf.get("group_chat_mode")
+                            )
+                            or "mention"
+                        ),
+                        acknowledge_mode=acknowledge_mode,
+                        acknowledgement_text=str(
+                            slack_conf.get("acknowledgement_text")
+                            or "Received. Analyzing…"
+                        ).strip(),
+                        # Not the ``or default`` the line above uses: empty is
+                        # how this key is turned off, so an operator who blanks
+                        # it must not be handed the default straight back. Only
+                        # a key that is absent entirely falls back.
+                        thinking_status=str(
+                            slack_conf.get(
+                                "thinking_status", DEFAULT_THINKING_STATUS
+                            )
+                            or ""
+                        ).strip(),
+                        # Unlike thinking_status above, blank does not turn
+                        # either off on its own -- both follow the ``or
+                        # <literal>`` pattern queued_emoji and its siblings
+                        # use below, since the lever for "no status at all" is
+                        # already acknowledge_mode: off.
+                        queued_status=str(
+                            slack_conf.get("queued_status")
+                            or "has queued a message"
+                        ).strip(),
+                        steered_status=str(
+                            slack_conf.get("steered_status")
+                            or "has steered a message into the running turn"
+                        ).strip(),
+                        # Not the bare ``or <literal>`` these six used to be:
+                        # resolve_reaction_emoji keeps blank meaning "use the
+                        # default" and adds one word, disabled, that turns a
+                        # single mark off while the other five keep working.
+                        # The default stays written here rather than moving
+                        # into the helper, so this block still reads as the
+                        # list of what the connector marks and with what.
+                        acknowledgement_emoji=resolve_reaction_emoji(
+                            slack_conf.get("acknowledgement_emoji"), "eyes"
+                        ),
+                        rejected_emoji=resolve_reaction_emoji(
+                            slack_conf.get("rejected_emoji"), "no_entry_sign"
+                        ),
+                        queued_emoji=resolve_reaction_emoji(
+                            slack_conf.get("queued_emoji"),
+                            "hourglass_flowing_sand",
+                        ),
+                        completed_emoji=resolve_reaction_emoji(
+                            slack_conf.get("completed_emoji"),
+                            "heavy_check_mark",
+                        ),
+                        failed_emoji=resolve_reaction_emoji(
+                            slack_conf.get("failed_emoji"), "x"
+                        ),
+                        stopped_emoji=resolve_reaction_emoji(
+                            slack_conf.get("stopped_emoji"),
+                            "black_square_for_stop",
+                        ),
+                        sdk_log_level=resolve_sdk_log_level(slack_conf),
+                        enable_streaming=enable_streaming,
+                        blockkit_tables=blockkit_tables,
+                        render_tables=render_tables,
+                        blockkit_allowed_block_types=blockkit_allowed_block_types,
+                        blockkit_allow_interactive=blockkit_allow_interactive,
+                        blockkit_validate=blockkit_validate,
+                        group_digital_avatar=bool(
+                            slack_conf.get("group_digital_avatar", False)
+                        ),
+                        my_user_id=str(slack_conf.get("my_user_id") or "").strip(),
+                        principal_name=str(
+                            slack_conf.get("principal_name") or ""
+                        ).strip(),
+                        bot_name=str(slack_conf.get("bot_name") or "").strip(),
+                        enable_memory=bool(slack_conf.get("enable_memory", False)),
+                        activity_card=bool(
+                            slack_conf.get(
+                                "activity_card",
+                                slack_conf.get("subagent_status_card", True),
+                            )
+                        ),
+                        activity_card_delay_seconds=activity_card_delay,
+                        activity_card_min_edit_seconds=activity_card_min_edit,
                     )
-                    slack_channel = SlackChannel(slack_config, _DummyBus())
-                    channel_manager.register_channel(slack_channel)
-                    slack_task = asyncio.create_task(slack_channel.start(), name="slack")
-                    logger.info("[App] SlackChannel registered from config.yaml.channels.slack")
+                    # Names every configured channel, so a mistyped-but-
+                    # well-formed id shows up in the log beside the ones that
+                    # work. Says where the bot listens.
+                    describe_configured_channels(slack_config)
+                    # The other half -- whether what the bot is asked to say
+                    # has anywhere to go -- is written per workspace inside the
+                    # loop below, since the fallback conversation it reads is
+                    # the one fact a workspace block carries beside credentials.
+
+                    # Digital avatar: build the adapter and register it with both
+                    # pipelines. Without a principal there is nobody for the
+                    # avatar to speak for, so the flag alone is not enough.
+                    slack_adapter = None
+                    if slack_config.group_digital_avatar and slack_config.my_user_id:
+                        from jiuwenswarm.gateway.channel_manager.im_platforms.slack.slack_im_adapter import \
+                            SlackIMPlatformAdapter
+                        slack_adapter = SlackIMPlatformAdapter(
+                            my_user_id=slack_config.my_user_id,
+                            principal_name=slack_config.principal_name,
+                            bot_name=slack_config.bot_name,
+                        )
+                        im_inbound.register_adapter("slack", slack_adapter)
+                        im_outbound.register_adapter("slack", slack_adapter)
+                    elif slack_config.group_digital_avatar:
+                        logger.warning(
+                            "[App] channels.slack.group_digital_avatar is on but "
+                            "my_user_id is empty; the digital avatar stays off"
+                        )
+                    # One SlackChannel per workspace, each with its own Socket
+                    # Mode connection, all in this process. A loop rather than
+                    # one channel serving several workspaces, and rather than
+                    # one channel holding several handlers: SlackChannel.start
+                    # ends in handler.start_async(), which blocks for the life
+                    # of the channel, so one instance cannot own two
+                    # connections. Per-instance isolation is also what makes the
+                    # bot user id, the bot id, the workspace host and every
+                    # per-conversation record correct without any of them
+                    # learning about workspaces.
+                    #
+                    # The shape is the Feishu apps loop's, down to keeping the
+                    # task on the channel object as start_task so the stop path
+                    # above can find it.
+                    for block_index, block in slack_blocks:
+                        # Empty for a config declaring one workspace, which
+                        # keys as ("slack", "default") -- the key this connector
+                        # has always registered under, so a single-workspace
+                        # deployment is untouched by the field existing. A
+                        # config declaring several names each of them by
+                        # position, which is stable while the file is: a block
+                        # turned off does not renumber the ones beside it.
+                        workspace_app_id = (
+                            "" if len(all_slack_blocks) == 1
+                            else f"workspace-{block_index + 1}"
+                        )
+                        workspace_config = dataclasses.replace(
+                            slack_config,
+                            app_id=workspace_app_id,
+                            bot_token=str(block.get("bot_token") or "").strip(),
+                            app_token=str(block.get("app_token") or "").strip(),
+                            default_channel_id=str(
+                                block.get("default_channel_id") or ""
+                            ).strip(),
+                        )
+                        # Per workspace, because it answers "has what this
+                        # instance is asked to say anywhere to go", and the
+                        # fallback conversation it reads is per workspace.
+                        await describe_slack_delivery_reachability(
+                            workspace_config,
+                            cron_store=cron_store,
+                            heartbeat_target=heartbeat_relay_channel,
+                        )
+                        workspace_channel = SlackChannel(
+                            workspace_config,
+                            _DummyBus(),
+                            im_platform_adapter=slack_adapter,
+                        )
+                        channel_manager.register_channel(workspace_channel)
+                        workspace_channel.start_task = asyncio.create_task(
+                            workspace_channel.start(),
+                            name=f"slack-{workspace_channel.app_id}",
+                        )
+                        logger.info(
+                            "[App] SlackChannel(app_id=%s) registered from"
+                            " config.yaml.channels.slack.workspaces[%d]",
+                            workspace_channel.app_id,
+                            block_index,
+                        )
             else:
                 logger.info("[App] channels.slack missing or invalid, SlackChannel disabled")
 
@@ -3357,7 +3730,7 @@ async def _run(
                 pass
             await xiaoyi_channel.stop()
         # ---- 从 channel_manager 清理所有动态注册的 channel 实例 ----
-        for _cid in ("feishu", "xiaoyi"):
+        for _cid in ("feishu", "xiaoyi", "slack"):
             for ch in channel_manager.pop_channels_by_id(_cid):
                 task = getattr(ch, "start_task", None)
                 if task is not None:

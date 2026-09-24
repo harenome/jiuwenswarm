@@ -1275,7 +1275,7 @@
       "discordHint": "Discord Bot messaging is supported. Enable Message Content Intent in Developer Portal and optionally set the target channel, the block_dm toggle can be used to block direct message.",
       "slackTitle": "Register Slack Channel",
       "slackSubtitle": "Configure Slack Socket Mode bot settings",
-      "slackHint": "Create a Slack app with Socket Mode enabled, an xoxb bot token, and an xapp app token. Subscribe to app_mention and message.im events.",
+      "slackHint": "Create a Slack app with Socket Mode enabled, an xoxb bot token, and an xapp app token. Basic chat uses app_mention and message.im. Automatic link channels also require channels:history and the message.channels event. Emoji acknowledgements require the reactions:write scope.",
       "telegramTitle": "Register Telegram Channel",
       "telegramSubtitle": "Configure Telegram Bot service settings",
       "whatsappTitle": "Register WhatsApp Channel",
@@ -1297,7 +1297,11 @@
       "slackAppToken": "Enter the xapp app token",
       "slackChannelId": "Enter the fallback Slack channel ID",
       "slackUserIds": "One Slack user ID per line (empty allows all users)",
-      "slackChannelIds": "One Slack channel ID per line (empty allows all channels)"
+      "slackChannelIds": "One Slack channel ID per line (empty allows all channels)",
+      "slackHistoryDigestChannelIds": "One allowed Slack conversation ID per line; use * for all accessible conversations (empty disables history digests)",
+      "slackAcknowledgementText": "Message sent immediately before agent processing",
+      "slackAcknowledgementEmoji": "Emoji name added to an accepted request, without colons (default: eyes)",
+      "slackRejectedEmoji": "Emoji name added when a request is refused by allow_from (default: no_entry_sign)"
     },
     "saved": {
       "feishu": "Lark settings saved",
@@ -1697,6 +1701,7 @@
       "tui": "Terminal (tui)",
       "xiaoyi": "Xiaoyi (xiaoyi)",
       "feishu": "Lark (feishu)",
+      "slack": "Slack (slack)",
       "dingtalk": "DingTalk (dingtalk)",
       "whatsapp": "WhatsApp (whatsapp)",
       "wecom": "WeCom (wecom)",

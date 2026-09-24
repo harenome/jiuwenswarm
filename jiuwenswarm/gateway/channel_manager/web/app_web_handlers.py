@@ -1403,6 +1403,41 @@ def _merge_apps_by_id(
     ]
 
 
+def _merge_partial_channel_conf(
+    stored: dict[str, Any] | None,
+    params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply a settings-page payload to a stored channel config as a partial update.
+
+    A ``channel.*.set_conf`` payload is written by one client -- the settings
+    page -- and that client knows the keys its own form has. It is not a
+    snapshot of the section. Handing it to ``ChannelManager.set_conf``
+    unchanged replaces the whole section, so every key the form has no field
+    for is deleted from the running config and the channel is rebuilt without
+    it. Which keys those are grows every time the config gains one the form
+    does not yet carry, so this is a property of the payload rather than of any
+    particular key, and the merge is written without naming one.
+
+    Two rules, and the second is the one that makes this a merge rather than a
+    filter:
+
+    * a key **present** in the payload wins, **including when its value is
+      empty**. Clearing a field is how the form deletes a credential, and a
+      merge that skipped empties would make a value impossible to remove from
+      the page that set it.
+    * a key **absent** from the payload is kept from the stored config. The
+      client said nothing about it, which is not the same as asking for it to
+      go.
+
+    The merge is one level deep on purpose. A payload key names a whole
+    setting, and a client that sends a list or a mapping for one is replacing
+    that setting, not patching inside it.
+    """
+    base = dict(stored) if isinstance(stored, dict) else {}
+    base.update(dict(params or {}))
+    return base
+
+
 def _normalize_feishu_conf(raw: dict) -> dict:
     """将 channels.feishu 统一为 apps 格式，并为每个 app 补充缺省字段。
 
@@ -4249,7 +4284,18 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             )
             return
         try:
-            await cm.set_conf("slack", params)
+            # The settings page posts the keys its Slack form carries and no
+            # others, so the payload is a partial update. channels.slack holds
+            # far more than the form does -- workspaces, the history policy,
+            # the emoji and statuses, streaming, the block-kit settings -- and
+            # replacing the section with the payload would drop all of it from
+            # the running config and rebuild the connector without it. On a
+            # multi-workspace deployment that means every workspace but the one
+            # the form can express stops connecting until the process is
+            # restarted from config.yaml. Merge instead.
+            await cm.set_conf(
+                "slack", _merge_partial_channel_conf(cm.get_conf("slack"), params)
+            )
             conf = cm.get_conf("slack")
             try:
                 update_channel_in_config("slack", conf)

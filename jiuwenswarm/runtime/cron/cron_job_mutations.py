@@ -156,6 +156,7 @@ def build_new_cron_job(
     timezone: str,
     description: str,
     targets: str,
+    post_as_root: bool = False,
     enabled: bool = True,
     wake_offset_seconds: int | None = None,
     session_id: str | None = None,
@@ -169,6 +170,7 @@ def build_new_cron_job(
     app_id: str = "",
     work_mode: str = DEFAULT_WEB_WORK_MODE,
     user_id: str = "",
+    slack_session_trusted: bool = False,
 ) -> CronJob:
     """Construct and validate a ``CronJob`` without persisting it."""
     now = time.time()
@@ -212,6 +214,7 @@ def build_new_cron_job(
         wake_offset_seconds=int(wake_offset_seconds) if wake_offset_seconds is not None else 0,
         description=str(description or ""),
         targets=str(targets or "").strip(),
+        post_as_root=bool(post_as_root),
         session_id=sid,
         created_at=now,
         updated_at=now,
@@ -225,6 +228,11 @@ def build_new_cron_job(
         app_id=str(app_id or "").strip(),
         work_mode=normalize_work_mode(work_mode, default=DEFAULT_WEB_WORK_MODE),
         user_id=str(user_id or "").strip(),
+        # Defaults to False: only a caller that has checked the creating
+        # request's own Slack provenance may ask for True (see
+        # ``slack_cron_session_is_trusted``). The store does not and cannot
+        # check it -- it never sees the request -- so it refuses to guess.
+        slack_session_trusted=bool(slack_session_trusted),
     )
     CronJob.from_dict(job.to_dict())
     return job
@@ -290,6 +298,8 @@ def apply_cron_job_patch(existing: CronJob, patch: dict[str, Any]) -> CronJob:
         updated = replace(updated, description=str(patch.get("description") or ""))
     if "targets" in patch:
         updated = replace(updated, targets=str(patch.get("targets") or "").strip())
+    if "post_as_root" in patch:
+        updated = replace(updated, post_as_root=bool(patch.get("post_as_root")))
     if "session_id" in patch:
         raw_sid = patch.get("session_id")
         new_sid = (
@@ -298,6 +308,17 @@ def apply_cron_job_patch(existing: CronJob, patch: dict[str, Any]) -> CronJob:
             else None
         )
         updated = replace(updated, session_id=new_sid)
+        # The trust flag was about the previous ``session_id`` and cannot
+        # survive the move. Cleared here rather than left to each caller: a
+        # caller that forgets would leave a job whose recorded channel and
+        # whose proven channel are different ones. A caller that has just
+        # re-established provenance says so in the same patch, and the
+        # explicit value below wins.
+        updated = replace(updated, slack_session_trusted=False)
+    if "slack_session_trusted" in patch:
+        updated = replace(
+            updated, slack_session_trusted=bool(patch.get("slack_session_trusted"))
+        )
     if "chat_type" in patch:
         raw_ct = patch.get("chat_type")
         new_ct = (

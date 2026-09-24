@@ -68,7 +68,7 @@ from openjiuwen.core.sys_operation import (
     SysOperationCard,
     OperationMode,
 )
-from openjiuwen.core.sys_operation.cwd import init_cwd
+from openjiuwen.core.sys_operation.cwd import get_workspace, init_cwd, set_cwd
 from openjiuwen.harness import (
     AudioModelConfig,
     DeepAgent,
@@ -386,6 +386,7 @@ from jiuwenswarm.symphony.llm import (
 )
 
 from jiuwenswarm.common.hooks_config import load_hooks_config
+from jiuwenswarm.common.interrupt_prompt import render_prompt_as_text
 from jiuwenswarm.common.log_preview import preview_text
 from jiuwenswarm.common.stage_timer import StageTimer
 from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unregister_tool
@@ -499,6 +500,51 @@ from jiuwenswarm.agents.harness.common.tools import (
 from jiuwenswarm.agents.harness.common.rails.symphony.retrieval_context_processor import (
     symphony_retrieval_compact_processor_spec,
 )
+from jiuwenswarm.agents.harness.common.tools.slack_history import SlackHistoryToolkit
+from jiuwenswarm.common.slack_history_policy import (
+    HISTORY_DISABLED,
+    METADATA_POLICY_KEY,
+    normalize_history_policy,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_search import (
+    SlackSearchToolkit,
+    slack_search_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_reactions import (
+    SlackReactionToolkit,
+    slack_reaction_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_bookmarks import (
+    SlackBookmarkToolkit,
+    slack_bookmark_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_pins import (
+    SlackPinToolkit,
+    slack_pin_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_directory import (
+    SlackDirectoryToolkit,
+    slack_find_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_post import (
+    SlackPostToolkit,
+    slack_post_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_home_tab import (
+    SlackHomeTabToolkit,
+    slack_home_tab_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_canvases import (
+    SlackCanvasToolkit,
+    slack_canvas_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.tools.slack_lists import (
+    SlackListToolkit,
+    slack_list_request_metadata,
+)
+from jiuwenswarm.agents.harness.common.rails.slack_write_confirmation_rail import (
+    SlackWriteConfirmationRail,
+)
 from jiuwenswarm.agents.harness.common.rails.skill_retrieval_prompt_rail import (
     SkillRetrievalPromptRail,
 )
@@ -586,6 +632,11 @@ from jiuwenswarm.server.runtime.agent_adapter.user_turn import TEAM_USER_TURN_KE
 from jiuwenswarm.agents.harness.common.auto_harness.service import _HARNESS_PACKAGES_FILE
 from jiuwenswarm.agents.harness.common.plugins.rail_manager import get_rail_manager
 from jiuwenswarm.runtime.cron import CronTargetChannel
+from jiuwenswarm.common.slack_routing import (
+    CRON_CHANNEL_ID as CRON_REQUEST_CHANNEL_ID,
+    SLACK_HISTORY_ORIGIN_CRON_JOB,
+    SLACK_HISTORY_ORIGIN_KEY,
+)
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse, AgentResponseChunk
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.common.playwright_mcp_runtime import (
@@ -708,6 +759,75 @@ def _permission_user_text_for_request(request: AgentRequest) -> str:
     query = params.get("query")
     return query.strip() if isinstance(query, str) else ""
 
+
+def _request_carries_slack_history_context(
+    channel_id: str,
+    metadata: dict[str, Any] | None,
+) -> bool:
+    """Whether this request is one of the two shapes that may name a channel.
+
+    An inbound Slack turn arrives on channel ``slack`` and the connector stamps
+    the conversation the message came from; the channel id is set by the
+    transport, so a request on any other channel with Slack-looking metadata
+    is by definition not one.
+
+    A cron run has no Slack channel of its own -- it arrives on ``__cron__`` --
+    so the equivalent assertion has to be explicit: the scheduler stamps the
+    conversation the job was created in and marks it as its own doing. Without
+    that marker a cron request naming a Slack channel is not honoured, so a
+    stray ``slack_channel_id`` left on a request cannot grant history access.
+
+    Neither shape is reachable by the model: request metadata is written by the
+    gateway before the turn starts and is not part of the tool argument surface.
+    """
+    channel = str(channel_id or "").strip().lower()
+    if channel == "slack":
+        return True
+    if channel != CRON_REQUEST_CHANNEL_ID:
+        return False
+    return (
+        isinstance(metadata, dict)
+        and metadata.get(SLACK_HISTORY_ORIGIN_KEY) == SLACK_HISTORY_ORIGIN_CRON_JOB
+    )
+
+
+def _filter_slack_history_request_metadata(
+    channel_id: str,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return trusted Slack history metadata or fail closed.
+
+    Both request shapes are held to the same two conditions: the conversation
+    must be named by request metadata rather than by a model argument, and the
+    policy decision must already have been taken by the side that has the
+    config. A cron run's decision is taken freshly on every run, so narrowing
+    the policy narrows cron as well.
+
+    The decision arrives as a word rather than a boolean. The runtime does not
+    read ``channels.slack`` for it and must not: the same conversation would
+    then be settled twice, in two processes, with two chances to disagree. An
+    absent word is *no connector settled this request* and mounts nothing, so a
+    path that has not been taught to stamp the word loses the tool rather than
+    gaining an ungoverned one.
+
+    ``disabled`` mounts nothing either, and that is the whole of this gate's
+    reading of the word. Every wider distinction -- whether a target may be
+    named at all, and which one -- is taken at read time against Slack, where
+    the membership is.
+    """
+    if not _request_carries_slack_history_context(channel_id, metadata):
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+    slack_channel_id = str(metadata.get("slack_channel_id") or "").strip()
+    if not slack_channel_id:
+        return {}
+    policy = normalize_history_policy(metadata.get(METADATA_POLICY_KEY))
+    if not policy or policy == HISTORY_DISABLED:
+        return {}
+    return dict(metadata)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -817,6 +937,30 @@ _SKILL_RETRIEVAL_TOOL_NAMES = frozenset(
         "skill_index",
     }
 )
+# The image-tool fallback notice is delivered verbatim to the user by every
+# channel (the web timeline and the IM connectors alike render ``content`` as
+# received), so it follows ``preferred_language`` rather than the prompt-facing
+# text around it. The model label includes its own brackets because CJK copy
+# takes full-width ones and needs no leading space.
+_IMAGE_TOOL_FALLBACK_NOTICE_CN = (
+    "当前模型{model_label}不支持原生图片理解，已切换为图片理解工具处理。"
+)
+_IMAGE_TOOL_FALLBACK_NOTICE_EN = (
+    "The current model{model_label} does not support native image understanding; "
+    "an image understanding tool is used instead."
+)
+# The same notice when no vision model tool is configured either: the fallback
+# named above is unavailable, so the user is told the attachment reached nothing
+# rather than that it was rerouted.
+_IMAGE_TOOL_FALLBACK_UNAVAILABLE_CN = (
+    "当前模型{model_label}不支持原生图片理解，且未配置可用的视觉模型工具。"
+)
+_IMAGE_TOOL_FALLBACK_UNAVAILABLE_EN = (
+    "The current model{model_label} does not support native image understanding, "
+    "and no vision model tool is configured."
+)
+_IMAGE_TOOL_FALLBACK_MODEL_LABEL_CN = "（{model_name}）"
+_IMAGE_TOOL_FALLBACK_MODEL_LABEL_EN = " ({model_name})"
 # Total ``_update_runtime_config`` cost above which its per-stage breakdown is
 # worth an INFO line. It runs once per turn ahead of the model call, so anything
 # at this scale is directly visible in time-to-first-token.
@@ -2132,6 +2276,27 @@ class JiuWenSwarmDeepAdapter:
         self._send_file_toolkit: SendFileToolkit | None = None
         self._session_messaging_toolkit: SessionMessagingToolkit | None = None
         self._session_messaging_route_rail: SessionMessagingRouteRail | None = None
+        self._slack_history_toolkit: SlackHistoryToolkit | None = None
+        self._slack_history_tools: list[Any] = []
+        self._slack_search_toolkit: SlackSearchToolkit | None = None
+        self._slack_search_tools: list[Any] = []
+        self._slack_reaction_toolkit: SlackReactionToolkit | None = None
+        self._slack_reaction_tools: list[Any] = []
+        self._slack_pin_toolkit: SlackPinToolkit | None = None
+        self._slack_pin_tools: list[Any] = []
+        self._slack_bookmark_toolkit: SlackBookmarkToolkit | None = None
+        self._slack_bookmark_tools: list[Any] = []
+        self._slack_directory_toolkit: SlackDirectoryToolkit | None = None
+        self._slack_directory_tools: list[Any] = []
+        self._slack_post_toolkit: SlackPostToolkit | None = None
+        self._slack_post_tools: list[Any] = []
+        self._slack_home_tab_toolkit: SlackHomeTabToolkit | None = None
+        self._slack_home_tab_tools: list[Any] = []
+        self._slack_canvas_toolkit: SlackCanvasToolkit | None = None
+        self._slack_canvas_tools: list[Any] = []
+        self._slack_list_toolkit: SlackListToolkit | None = None
+        self._slack_list_tools: list[Any] = []
+        self._slack_write_rail: SlackWriteConfirmationRail | None = None
         self._runtime_state_write_task: asyncio.Task[None] | None = None
         self._channel_id: str | None = None
         self._is_cron_execution: bool = False
@@ -6967,6 +7132,7 @@ class JiuWenSwarmDeepAdapter:
         enable_read_image_multimodal: bool,
         model: Any | None,
         vision_tool_available: bool,
+        language: str,
     ) -> dict[str, Any] | None:
         if enable_read_image_multimodal:
             return None
@@ -6981,14 +7147,26 @@ class JiuWenSwarmDeepAdapter:
 
         model_config = getattr(model, "model_config", None)
         model_name = str(getattr(model_config, "model_name", "") or "").strip()
-        model_label = f"（{model_name}）" if model_name else ""
+        english = str(language or "").strip().lower() == "en"
+        label_template = (
+            _IMAGE_TOOL_FALLBACK_MODEL_LABEL_EN
+            if english
+            else _IMAGE_TOOL_FALLBACK_MODEL_LABEL_CN
+        )
+        model_label = label_template.format(model_name=model_name) if model_name else ""
         if vision_tool_available:
-            content = f"当前模型{model_label}不支持原生图片理解，已切换为图片理解工具处理。"
-        else:
-            content = (
-                f"当前模型{model_label}不支持原生图片理解，"
-                "且未配置可用的视觉模型工具。"
+            notice_template = (
+                _IMAGE_TOOL_FALLBACK_NOTICE_EN
+                if english
+                else _IMAGE_TOOL_FALLBACK_NOTICE_CN
             )
+        else:
+            notice_template = (
+                _IMAGE_TOOL_FALLBACK_UNAVAILABLE_EN
+                if english
+                else _IMAGE_TOOL_FALLBACK_UNAVAILABLE_CN
+            )
+        content = notice_template.format(model_label=model_label)
         notice = {
             "event_type": "chat.notice",
             "notice_type": "image_tool_fallback",
@@ -10703,14 +10881,20 @@ class JiuWenSwarmDeepAdapter:
                 get_agent_workspace_dir()
             )
         else:
-            initial_runtime_workspace = self._project_dir or str(
-                get_default_project_session_workspace_dir()
-            )
+            # Session-keyed rather than the shared ``projects`` root: this seed
+            # is the CwdState the whole session runs on (see below), so it has
+            # to name the session already.
+            initial_runtime_workspace = self._initial_runtime_workspace()
         initial_cwd = initial_runtime_workspace
         if self._enable_auto_permission:
             initial_cwd = str(self._require_permission_workspace_binding().cwd)
             self._instance.deep_config.cwd = initial_cwd
             self._instance.deep_config.project_root = initial_runtime_workspace
+        # ``start_interaction`` runs right after this and starts the controller's
+        # long-lived TaskScheduler; the scheduler, its supervisor, rounds, tool
+        # tasks and subagents all inherit whatever CwdState this seed installs,
+        # through their copied Context.  So this is the seed the agent runs on
+        # for the whole session, and it has to name the session already.
         self._seed_runtime_cwd(initial_cwd, workspace=initial_runtime_workspace)
         setattr(self._instance, "_jiuwenswarm_project_dir", initial_runtime_workspace)
 
@@ -11750,6 +11934,688 @@ class JiuWenSwarmDeepAdapter:
                     require_execution_authorization=require_send_authorization,
                 )
 
+        # Ahead of the history block below, because that block returns early for
+        # a request that may not read history -- and whether a turn may search
+        # is a separate question with a separate answer. Sequencing search after
+        # it would make one tool's absence silently decide the other's.
+        self._refresh_slack_search_runtime_tool()
+        # Ahead of the same block for the same reason, and on its own predicate
+        # for one of its own: marking a message is not reading a conversation,
+        # so the history policy word does not decide it.
+        self._refresh_slack_reaction_runtime_tool()
+        # A write, and a third independent decision. It is mounted for a
+        # request whose conversation the gateway named, and for no other, which
+        # is neither the search tool's condition nor the history tool's: a turn
+        # may pin without being allowed to read a line of scrollback.
+        self._refresh_slack_pin_runtime_tool()
+        # The bookmark bar, read and write, on the same predicate and as a
+        # fifth independent decision. A bookmark is a title and a link
+        # somebody put on the wall rather than anything in the scrollback, so
+        # the history policy word governs neither half of it, and a turn may
+        # read or change the bar without being allowed to read a line of
+        # conversation.
+        self._refresh_slack_bookmark_runtime_tools()
+        # A sixth independent decision, and the widest predicate of the six:
+        # turning a name into an id reads no conversation and writes nothing,
+        # so all it needs is that the request came from Slack at all. A turn
+        # that may not read a line of scrollback may still find out which
+        # channel "#announcements" is.
+        self._refresh_slack_directory_runtime_tool()
+        # A seventh independent decision, and the only one with a policy word of
+        # its own. Posting where the model says is the one Slack capability an
+        # operator has to turn on by hand, so this one reads
+        # channels.slack.write off the request before it mounts anything -- and
+        # it is awaited, unlike the six above, because a widening post has to be
+        # put to somebody and the rail that asks is registered here beside the
+        # tools it asks about.
+        await self._refresh_slack_post_runtime_tools()
+        # An eighth independent decision, and the only one whose surface is not
+        # a conversation at all. A Home tab belongs to one person, so what this
+        # one needs is that the request names the person whose turn it is --
+        # neither the conversation the other seven are mounted on nor any
+        # policy word, because there is no destination to govern the reach of.
+        self._refresh_slack_home_tab_runtime_tools()
+        # A ninth independent decision, and the second whose surface is not a
+        # conversation. A canvas is a document in the workspace rather than
+        # anything in a conversation, so what the six canvas tools need is that
+        # a Slack install can be resolved for this request -- neither a
+        # conversation nor a requester, because five of them name no
+        # conversation at all and the sixth takes one as an argument.
+        self._refresh_slack_canvas_runtime_tools()
+        # A tenth independent decision, and the third whose surface is not a
+        # conversation. A Slack List is a table in the workspace, so what the
+        # five List tools need is the same thing the canvas tools need -- that
+        # a Slack install can be resolved for this request -- and neither a
+        # conversation nor a requester, because no tool here names a
+        # conversation except as something to share a List with.
+        self._refresh_slack_list_runtime_tools()
+
+        # Slack history is deliberately scoped to the current Slack request.
+        # The channel comes from trusted transport metadata rather than a model
+        # argument, so the tool cannot be used to read an arbitrary channel.
+        slack_history_enabled = bool(self._get_slack_history_request_metadata())
+        # All three tools, one predicate. download_slack_file needs a trusted S to
+        # gate against and needs nothing else -- files.info and the download
+        # both run on the bot token alone -- and read_pinned_messages is the
+        # same rule applied to a conversation's pins, so both share the history
+        # tool's per-request availability test unchanged. A cron run therefore
+        # opens files and lists pins, its S being the conversation it delivers
+        # into, exactly as it reads history.
+        slack_history_tool_names = {
+            "read_slack_conversation",
+            "download_slack_file",
+            "read_pinned_messages",
+        }
+
+        if not slack_history_enabled:
+            # Once registered, keep the ability stable across concurrent
+            # transports. The request-context provider fails closed for
+            # non-Slack and non-allowlisted requests at invocation time.
+            return
+
+        if self._slack_history_toolkit is None:
+            self._slack_history_toolkit = SlackHistoryToolkit(
+                metadata_provider=self._get_slack_history_request_metadata,
+                session_id_provider=self._get_slack_history_session_id,
+            )
+            self._slack_history_tools = self._slack_history_toolkit.get_tools()
+            for history_tool in self._slack_history_tools:
+                Runner.resource_mgr.add_tool(history_tool)
+                self._instance.ability_manager.add(history_tool.card)
+        else:
+            # The toolkit reads request metadata from the session-scoped context
+            # proxy at invocation time. It therefore survives the DeepAgent
+            # worker boundary without accepting a model-supplied channel id.
+            registered_names = {
+                getattr(existing, "name", "")
+                for existing in (self._instance.ability_manager.list() or [])
+            }
+            if not slack_history_tool_names.issubset(registered_names):
+                for history_tool in self._slack_history_tools:
+                    tool_name = str(
+                        getattr(history_tool, "name", "")
+                        or getattr(getattr(history_tool, "card", None), "name", "")
+                    )
+                    if tool_name not in registered_names:
+                        self._instance.ability_manager.add(history_tool.card)
+
+    def _refresh_slack_search_runtime_tool(self) -> None:
+        """Register the Slack search tool for a turn that is able to use it.
+
+        A second decision rather than a branch of the history one: the two tools
+        need different things to be true, so a turn can have either, both or
+        neither.
+
+        Search's predicate has a term history's has not. Slack issues the
+        permission a search call needs with the inbound event, so a turn that no
+        Slack event started -- a scheduled job above all -- can never search,
+        however the install is configured, and this cannot be settled once at
+        start-up.
+
+        Registration is one-way within a process, as the history tool's is: the
+        card is shared across concurrent transports, so removing it because
+        *this* request cannot search would take it from a simultaneous request
+        that can. The provider fails closed at invocation time, per request.
+        """
+        if not self._get_slack_search_request_metadata():
+            return
+
+        if self._slack_search_toolkit is None:
+            self._slack_search_toolkit = SlackSearchToolkit(
+                metadata_provider=self._get_slack_search_request_metadata,
+            )
+            self._slack_search_tools = self._slack_search_toolkit.get_tools()
+            for search_tool in self._slack_search_tools:
+                Runner.resource_mgr.add_tool(search_tool)
+                self._instance.ability_manager.add(search_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for search_tool in self._slack_search_tools:
+            tool_name = str(
+                getattr(search_tool, "name", "")
+                or getattr(getattr(search_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(search_tool.card)
+
+    def _refresh_slack_pin_runtime_tool(self) -> None:
+        """Register the Slack pin tool for a turn whose conversation is known.
+
+        One condition, and it is the whole of the mount: the gateway named the
+        conversation this request is about. There is no policy word to consult
+        -- the history policy governs reads and says nothing about writes --
+        and no operator flag, because ``permissions.tools`` is where a write is
+        allowed or refused and a second switch beside it would only be a way
+        for the two to disagree.
+
+        Registration is one-way within a process, as the other two Slack tools'
+        is: the card is shared across concurrent transports, so withdrawing it
+        because *this* request is not a Slack one would take it from a
+        simultaneous request that is. The provider fails closed per request,
+        and the tool refuses a request that carries no conversation.
+        """
+        if not self._get_slack_pin_request_metadata():
+            return
+
+        if self._slack_pin_toolkit is None:
+            self._slack_pin_toolkit = SlackPinToolkit(
+                metadata_provider=self._get_slack_pin_request_metadata,
+            )
+            self._slack_pin_tools = self._slack_pin_toolkit.get_tools()
+            for pin_tool in self._slack_pin_tools:
+                Runner.resource_mgr.add_tool(pin_tool)
+                self._instance.ability_manager.add(pin_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for pin_tool in self._slack_pin_tools:
+            tool_name = str(
+                getattr(pin_tool, "name", "")
+                or getattr(getattr(pin_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(pin_tool.card)
+
+    def _get_slack_pin_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata for the pin tool across the worker boundary."""
+        return slack_pin_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _refresh_slack_home_tab_runtime_tools(self) -> None:
+        """Register the two Home tab tools for a turn that names who asked.
+
+        The eighth Slack decision, and the only one whose surface is not a
+        conversation. The seven before it act in a conversation and are mounted
+        for a turn whose conversation the gateway named; a Home tab belongs to
+        one person, so the condition here is that the request names the person
+        whose turn this is, and nothing else.
+
+        No policy word is consulted, and the absence is the argument rather than
+        an omission. ``channels.slack.history`` says how far this conversation
+        may read, and a Home tab holds nothing that was read.
+        ``channels.slack.write`` says how far a post may reach, and these tools
+        name no destination: the surface is the requester's own private page and
+        there is no argument that could aim it anywhere else. Making either tool
+        depend on a word written for a different question would take it from
+        deployments that never meant to withhold it. ``permissions.tools`` is
+        where each of the two names is allowed or refused, and a second switch
+        beside it would only be a way for the two to disagree.
+
+        No confirmation rail either, for the same reason: a rail that asks
+        before an audience widens has nothing to ask about a page one person
+        sees, and that person is the one who asked.
+
+        Registration is one-way within a process, as the seven above are: the
+        cards are shared across concurrent transports, so withdrawing them
+        because *this* request names nobody would take them from a simultaneous
+        request that does. The provider fails closed per request, and each tool
+        refuses a request that names nobody.
+        """
+        if not self._get_slack_home_tab_request_metadata():
+            return
+
+        if self._slack_home_tab_toolkit is None:
+            self._slack_home_tab_toolkit = SlackHomeTabToolkit(
+                metadata_provider=self._get_slack_home_tab_request_metadata,
+            )
+            self._slack_home_tab_tools = self._slack_home_tab_toolkit.get_tools()
+            for home_tool in self._slack_home_tab_tools:
+                Runner.resource_mgr.add_tool(home_tool)
+                self._instance.ability_manager.add(home_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for home_tool in self._slack_home_tab_tools:
+            tool_name = str(
+                getattr(home_tool, "name", "")
+                or getattr(getattr(home_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(home_tool.card)
+
+    def _get_slack_home_tab_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata for the Home tab tools across the worker boundary."""
+        return slack_home_tab_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _refresh_slack_canvas_runtime_tools(self) -> None:
+        """Register the six canvas tools for a turn a Slack install can serve.
+
+        One condition, and it is the whole of the mount: this request came from
+        Slack, or is a scheduled run the scheduler marked as its own. A canvas
+        is a document in the workspace rather than anything in a conversation,
+        so neither the conversation the seven conversation tools are mounted on
+        nor the requester the Home tab tools are mounted on is required here.
+
+        No policy word is consulted, and the absence is the argument rather
+        than an omission. ``channels.slack.history`` says how far this
+        conversation may read scrollback, and a canvas holds none of it.
+        ``channels.slack.write`` says how far a *post* may reach, and nothing
+        here posts: the sharing tool refuses rather than sending the message
+        that would share a canvas, precisely so that it never writes into a
+        conversation without passing that rail. ``permissions.tools`` is where
+        each of the six names is allowed or refused, and a second switch beside
+        it would only be a way for the two to disagree.
+
+        Registration is one-way within a process, as every other Slack tool's
+        is: the cards are shared across concurrent transports, so withdrawing
+        them because *this* request is not a Slack one would take them from a
+        simultaneous request that is. The provider fails closed per request,
+        and each tool refuses a request no Slack path settled.
+        """
+        if not self._get_slack_canvas_request_metadata():
+            return
+
+        if self._slack_canvas_toolkit is None:
+            self._slack_canvas_toolkit = SlackCanvasToolkit(
+                metadata_provider=self._get_slack_canvas_request_metadata,
+            )
+            self._slack_canvas_tools = self._slack_canvas_toolkit.get_tools()
+            for canvas_tool in self._slack_canvas_tools:
+                Runner.resource_mgr.add_tool(canvas_tool)
+                self._instance.ability_manager.add(canvas_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for canvas_tool in self._slack_canvas_tools:
+            tool_name = str(
+                getattr(canvas_tool, "name", "")
+                or getattr(getattr(canvas_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(canvas_tool.card)
+
+    def _get_slack_canvas_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata for the canvas tools across the worker boundary."""
+        return slack_canvas_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _refresh_slack_list_runtime_tools(self) -> None:
+        """Register the five List tools for a turn a Slack install can serve.
+
+        One condition, and it is the whole of the mount: this request came from
+        Slack, or is a scheduled run the scheduler marked as its own. A List is
+        a table in the workspace rather than anything in a conversation, so
+        neither the conversation the seven conversation tools are mounted on
+        nor the requester the Home tab tools are mounted on is required here.
+
+        No policy word is consulted, and the absence is the argument rather
+        than an omission. ``channels.slack.history`` says how far this
+        conversation may read scrollback, and a List holds none of it.
+        ``channels.slack.write`` says how far a *post* may reach, and nothing
+        here posts: sharing a List grants access to it and sends nobody a
+        message about it. ``permissions.tools`` is where each of the five names
+        is allowed or refused -- which is also where ``delete_slack_list`` is
+        narrowed, it being the one that destroys something -- and a second
+        switch beside it would only be a way for the two to disagree.
+
+        Registration is one-way within a process, as every other Slack tool's
+        is: the cards are shared across concurrent transports, so withdrawing
+        them because *this* request is not a Slack one would take them from a
+        simultaneous request that is. The provider fails closed per request,
+        and each tool refuses a request no Slack path settled.
+        """
+        if not self._get_slack_list_request_metadata():
+            return
+
+        if self._slack_list_toolkit is None:
+            self._slack_list_toolkit = SlackListToolkit(
+                metadata_provider=self._get_slack_list_request_metadata,
+            )
+            self._slack_list_tools = self._slack_list_toolkit.get_tools()
+            for list_tool in self._slack_list_tools:
+                Runner.resource_mgr.add_tool(list_tool)
+                self._instance.ability_manager.add(list_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for list_tool in self._slack_list_tools:
+            tool_name = str(
+                getattr(list_tool, "name", "")
+                or getattr(getattr(list_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(list_tool.card)
+
+    def _get_slack_list_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata for the List tools across the worker boundary."""
+        return slack_list_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _refresh_slack_bookmark_runtime_tools(self) -> None:
+        """Register the Slack bookmark tools for a turn whose conversation is known.
+
+        One condition for both, and it is the whole of the mount: the gateway
+        named the conversation this request is about. There is no policy word
+        to consult -- the history policy governs how far scrollback may be read
+        out, and a bookmark holds none of it -- and no operator flag, because
+        ``permissions.tools`` is where each of the two names is allowed or
+        refused and a second switch beside it would only be a way for the two
+        to disagree.
+
+        Both tools mount together because the predicate is the same for both;
+        they stay two names so that *may see the bar, may not change it* can be
+        written down.
+
+        Registration is one-way within a process, as the other Slack tools' is:
+        the cards are shared across concurrent transports, so withdrawing them
+        because *this* request is not a Slack one would take them from a
+        simultaneous request that is. The provider fails closed per request,
+        and both tools refuse a request that carries no conversation.
+        """
+        if not self._get_slack_bookmark_request_metadata():
+            return
+
+        if self._slack_bookmark_toolkit is None:
+            self._slack_bookmark_toolkit = SlackBookmarkToolkit(
+                metadata_provider=self._get_slack_bookmark_request_metadata,
+            )
+            self._slack_bookmark_tools = self._slack_bookmark_toolkit.get_tools()
+            for bookmark_tool in self._slack_bookmark_tools:
+                Runner.resource_mgr.add_tool(bookmark_tool)
+                self._instance.ability_manager.add(bookmark_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for bookmark_tool in self._slack_bookmark_tools:
+            tool_name = str(
+                getattr(bookmark_tool, "name", "")
+                or getattr(getattr(bookmark_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(bookmark_tool.card)
+
+    def _get_slack_bookmark_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata for the bookmark tools across the boundary."""
+        return slack_bookmark_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _refresh_slack_directory_runtime_tool(self) -> None:
+        """Register the Slack name lookup for a turn that came from Slack.
+
+        The sixth independent decision, and the one with the fewest terms. An
+        id is only meaningful in the workspace that minted it, so the request
+        has to say which workspace it belongs to; nothing further is needed,
+        because the tool reads no conversation, writes nothing, and holds no
+        per-event token. A cron run therefore resolves a name exactly as an
+        inbound turn does.
+
+        The history policy word is deliberately not consulted. It governs how
+        far a conversation's record may be read out, and a result here is a
+        name, an id and a handful of flags. The one thing the operator's
+        history settings do decide is the ``history_never_read`` list, and the
+        tool applies that itself to the conversations it would return.
+
+        Registration is one-way within a process, as the other five are: the
+        card is shared across concurrent transports, so withdrawing it because
+        *this* request is not a Slack one would take it from a simultaneous
+        request that is. The provider fails closed at invocation time.
+        """
+        if not self._get_slack_directory_request_metadata():
+            return
+
+        if self._slack_directory_toolkit is None:
+            self._slack_directory_toolkit = SlackDirectoryToolkit(
+                metadata_provider=self._get_slack_directory_request_metadata,
+            )
+            self._slack_directory_tools = self._slack_directory_toolkit.get_tools()
+            for directory_tool in self._slack_directory_tools:
+                Runner.resource_mgr.add_tool(directory_tool)
+                self._instance.ability_manager.add(directory_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for directory_tool in self._slack_directory_tools:
+            tool_name = str(
+                getattr(directory_tool, "name", "")
+                or getattr(getattr(directory_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(directory_tool.card)
+
+    def _get_slack_directory_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata for the name lookup across the boundary.
+
+        Two questions, asked in the order they depend on each other, and the
+        pair the reaction tool already asks. May this *request shape* be a
+        Slack one at all is the predicate the history gate applies, reused
+        rather than restated so that one answer cannot drift from the other.
+        Given that, the tool module decides what it needs from the metadata.
+        """
+        if not _request_carries_slack_history_context(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        ):
+            return {}
+        return slack_find_request_metadata(
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    async def _refresh_slack_post_runtime_tools(self) -> None:
+        """Register the three Slack posting tools for a turn that may post.
+
+        The seventh Slack decision, and the only one that reads a policy word.
+        The six above are mounted for any turn whose conversation the gateway
+        named, because each of them acts in that conversation and can reach
+        nowhere else. These can name a conversation, so there is a second
+        question -- how far -- and ``channels.slack.write`` is the operator's
+        answer to it. ``disabled`` is the default and mounts nothing, so a
+        deployment that has not written the key sees no change at all.
+
+        **The confirmation rail is registered here, beside the tools, and under
+        ``members`` the tools are not mounted without it.** That word's promise
+        is that a post reaching people outside this conversation is put to
+        whoever asked before it is sent, and the rail is the only thing that can
+        put it: a tool returns a string and has no way to stop and ask. Mounting
+        the tools with the rail missing would keep the word and drop the
+        promise, which is the one failure here that is silent on both sides --
+        the operator reads ``members`` in their config and the post goes out
+        unasked.
+
+        Registration is one-way within a process, as the other six are: the
+        cards are shared across concurrent transports, so withdrawing them
+        because *this* request may not post would take them from a simultaneous
+        request that may. The provider fails closed per request, and every tool
+        refuses a request carrying no settled word.
+
+        The rail stays registered once it is, for the same reason and with no
+        cost: it watches two tool names and approves every call that is not
+        widening, so a turn that cannot post never reaches it.
+        """
+        metadata = self._get_slack_post_request_metadata()
+        if not metadata:
+            return
+
+        if self._slack_post_toolkit is None:
+            toolkit = SlackPostToolkit(
+                metadata_provider=self._get_slack_post_request_metadata,
+            )
+            if toolkit.confirms_widening() and not await self._register_slack_write_rail(
+                toolkit
+            ):
+                # Said loudly and mounted not at all. An operator who wrote
+                # ``members`` asked for a question to be put before a post
+                # widens, and there is now nothing that can put it.
+                logger.error(
+                    "[JiuwenSwarmDeepAdapter] channels.slack.write is members,"
+                    " which posts to a wider conversation only after asking the"
+                    " person who asked, and the rail that asks could not be"
+                    " registered; the Slack posting tools are not offered to"
+                    " this turn"
+                )
+                return
+            self._slack_post_toolkit = toolkit
+            self._slack_post_tools = toolkit.get_tools()
+            for post_tool in self._slack_post_tools:
+                Runner.resource_mgr.add_tool(post_tool)
+                self._instance.ability_manager.add(post_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for post_tool in self._slack_post_tools:
+            tool_name = str(
+                getattr(post_tool, "name", "")
+                or getattr(getattr(post_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(post_tool.card)
+
+    async def _register_slack_write_rail(self, toolkit: SlackPostToolkit) -> bool:
+        """Put the widening-confirmation rail on the agent. ``False`` = it is not on.
+
+        Answering ``False`` rather than raising, because the caller's response to
+        it is to mount nothing rather than to fail the turn: every other tool
+        this turn holds is unaffected by a Slack posting tool that is not there.
+        """
+        if self._slack_write_rail is not None:
+            return True
+        try:
+            rail = SlackWriteConfirmationRail(toolkit)
+            await self._instance.register_rail(rail)
+        except Exception as exc:  # noqa: BLE001 - rail APIs vary by version.
+            logger.warning(
+                "[JiuwenSwarmDeepAdapter] the Slack write confirmation rail"
+                " could not be registered: %s",
+                exc,
+            )
+            return False
+        self._slack_write_rail = rail
+        return True
+
+    def _get_slack_post_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata for the posting tools across the boundary."""
+        return slack_post_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _get_slack_history_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack metadata across the DeepAgent worker boundary."""
+        return _filter_slack_history_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _get_slack_history_session_id(self) -> str:
+        """The session ``download_slack_file`` writes into, per request.
+
+        The same contextvar-backed proxy the metadata provider reads, and for
+        the same reason: the toolkit is built once and answers every request for
+        the life of the process, so a session id captured at construction would
+        be one session's id forever. ``_bind_runtime_cron_context`` sets this
+        for every chat turn and not only for cron runs.
+
+        Grants nothing: it decides *where a file is written*, never whether it
+        may be read. An empty answer is a refusal on the tool's side rather
+        than a fallback directory.
+        """
+        return str(self._runtime_cron_tool_context.session_id or "").strip()
+
+    def _get_slack_search_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack search metadata across the worker boundary."""
+        return slack_search_request_metadata(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        )
+
+    def _refresh_slack_reaction_runtime_tool(self) -> None:
+        """Register the Slack reaction tool for a turn that has a conversation.
+
+        A third decision beside history's and search's, not a branch of either.
+        Reacting writes a mark into the conversation the request came from and
+        reads nothing out of it, so what it needs is only that the request has
+        such a conversation -- which is the same pair of request shapes that
+        may name one at all, and nothing further.
+
+        Registration is one-way within a process, as the other two are: the
+        card is shared across concurrent transports, so withdrawing it because
+        *this* request has no conversation would take it from a simultaneous
+        request that has one. The provider fails closed at invocation time,
+        per request.
+        """
+        if not self._get_slack_reaction_request_metadata():
+            return
+
+        if self._slack_reaction_toolkit is None:
+            self._slack_reaction_toolkit = SlackReactionToolkit(
+                metadata_provider=self._get_slack_reaction_request_metadata,
+            )
+            self._slack_reaction_tools = self._slack_reaction_toolkit.get_tools()
+            for reaction_tool in self._slack_reaction_tools:
+                Runner.resource_mgr.add_tool(reaction_tool)
+                self._instance.ability_manager.add(reaction_tool.card)
+            return
+
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        for reaction_tool in self._slack_reaction_tools:
+            tool_name = str(
+                getattr(reaction_tool, "name", "")
+                or getattr(getattr(reaction_tool, "card", None), "name", "")
+            )
+            if tool_name and tool_name not in registered_names:
+                self._instance.ability_manager.add(reaction_tool.card)
+
+    def _get_slack_reaction_request_metadata(self) -> dict[str, Any]:
+        """Read trusted Slack reaction metadata across the worker boundary.
+
+        Two questions, asked in the order they depend on each other. May this
+        *request shape* name a Slack conversation at all -- an inbound Slack
+        turn, or a cron run the scheduler marked as its own -- is the predicate
+        the history gate already applies, reused rather than restated so that
+        one answer cannot drift from the other. Given that, the tool module
+        decides what it needs from the metadata itself.
+
+        The history policy word is deliberately not consulted. It governs how
+        far a conversation's record may be read out; a mark left on a message
+        discloses nothing, and the connector already leaves one on every turn.
+        """
+        if not _request_carries_slack_history_context(
+            self._runtime_cron_tool_context.channel_id,
+            self._runtime_cron_tool_context.metadata,
+        ):
+            return {}
+        return slack_reaction_request_metadata(
+            self._runtime_cron_tool_context.metadata,
+        )
+
     def _refresh_acp_runtime_tools(
         self,
         session_id: str | None,
@@ -11828,25 +12694,51 @@ class JiuWenSwarmDeepAdapter:
         if self._instance.deep_config is not None:
             self._instance.deep_config.language = resolved_language
 
-    def _seed_runtime_cwd(
-        self, cwd: str | None = None, workspace: str | None = None
-    ) -> None:
-        """Seed Core's CwdState holder from the request/runtime cwd.
+    def _initial_runtime_workspace(self) -> str:
+        """Directory this adapter's agent starts in, for its whole session.
 
-        ``workspace``: optional per-request workspace override. When set,
-        becomes the workspace anchor for tools that read ``get_workspace()``
-        (notably ``fs_operation``'s sandbox enforcement, which gates
-        absolute-path writes by membership in the workspace tree). When
-        unset, falls back to the agent's instance-level workspace.
+        A session-scoped adapter keys this off the session it was created for,
+        so each conversation gets its own ``projects/<session_id>/``. The root
+        adapter owns no session and keeps the shared ``projects`` root, which is
+        also what ``get_default_project_session_workspace_dir`` returns for an
+        empty session id.
         """
-        workspace_root = str(
-            workspace or self._workspace_dir or self._project_dir or os.getcwd()
+        return self._project_dir or str(
+            get_default_project_session_workspace_dir(self._parent_session_id)
         )
+
+    def _runtime_workspace_root(self, workspace: str | None) -> str:
+        return str(workspace or self._workspace_dir or self._project_dir or os.getcwd())
+
+    def _resolve_runtime_cwd(self, cwd: str | None, workspace_root: str) -> str:
+        """Pick the first directory that exists: request cwd, project dir, workspace."""
         runtime_cwd = str(cwd or "").strip()
         if not runtime_cwd or not os.path.isdir(runtime_cwd):
             runtime_cwd = str(self._project_dir or "").strip()
         if not runtime_cwd or not os.path.isdir(runtime_cwd):
             runtime_cwd = workspace_root
+        return runtime_cwd
+
+    def _seed_runtime_cwd(
+        self, cwd: str | None = None, workspace: str | None = None
+    ) -> None:
+        """Install a fresh CwdState holder for this agent, replacing any inherited one.
+
+        ``init_cwd`` is the *replace* write: it binds a brand-new CwdState in
+        the current context, which is how Core isolates one agent's cwd from its
+        parent's. Call it once per agent startup, as Core documents -- for a host
+        adapter that means at construction, before ``start_interaction`` starts
+        the controller's long-lived TaskScheduler. Per-turn moves of an
+        already-bound session must go through :meth:`_reseed_runtime_cwd`.
+
+        ``workspace``: optional workspace override. When set, becomes the
+        workspace anchor for tools that read ``get_workspace()`` (notably
+        ``fs_operation``'s sandbox enforcement, which gates absolute-path writes
+        by membership in the workspace tree). When unset, falls back to the
+        agent's instance-level workspace.
+        """
+        workspace_root = self._runtime_workspace_root(workspace)
+        runtime_cwd = self._resolve_runtime_cwd(cwd, workspace_root)
         init_cwd(runtime_cwd, project_root=workspace_root, workspace=workspace_root)
 
     @staticmethod
@@ -11902,6 +12794,51 @@ class JiuWenSwarmDeepAdapter:
             normalized.split(".", 1)[0] == "agent"
             and not is_code_profile_mode(normalized)
         )
+
+    def _reseed_runtime_cwd(
+        self, cwd: str | None = None, workspace: str | None = None
+    ) -> None:
+        """Move an already-seeded session's cwd in place, so live tasks see it.
+
+        The construction-time :meth:`_seed_runtime_cwd` runs before the
+        controller's long-lived TaskScheduler starts, so the scheduler, its
+        supervisor, every round, tool call and subagent hold a reference to
+        *that* CwdState object through their copied Context. ``init_cwd``
+        installs a different object in the calling context only, so those tasks
+        keep the old reference and never observe it. That reference copy is the
+        inter-agent isolation Core's ``cwd`` module documents, and it makes
+        ``init_cwd`` the wrong write for a per-turn move. ``set_cwd`` mutates
+        the object they already share, which is the only write that reaches
+        them.
+
+        ``project_root`` and ``workspace`` stay where the session seed put them
+        as long as the seed still names the same root: Core documents the
+        project root as never changing mid-session, and the workspace anchors
+        ``fs_operation``'s sandbox for the whole session. Moving the cwd only
+        widens that sandbox, because ``get_cwd()`` is itself one of its roots.
+
+        A root that has actually moved is the exception, and it is not
+        hypothetical: an adapter that binds its runtime workspace after
+        construction -- the auto-permission prewarm does, because the binding
+        needs the session -- is seeded with a placeholder and learns its real
+        root on the first configure. ``set_cwd`` cannot carry that, because the
+        workspace lives on the CwdState object and only ``init_cwd`` installs
+        one, so a moved root re-seeds. Nothing is running to miss it: a root
+        moves before the controller's TaskScheduler starts, and every later turn
+        of the same session recomputes the same root and takes the mutation.
+
+        A turn whose context inherited no CwdState has nothing to mutate; seed
+        one so this task still gets all three layers.
+        """
+        current_workspace = get_workspace()
+        if current_workspace is None:
+            self._seed_runtime_cwd(cwd, workspace=workspace)
+            return
+        workspace_root = self._runtime_workspace_root(workspace)
+        if str(current_workspace) != workspace_root:
+            self._seed_runtime_cwd(cwd, workspace=workspace)
+            return
+        set_cwd(self._resolve_runtime_cwd(cwd, workspace_root))
 
     @dataclass
     class _RuntimeConfig:
@@ -12087,7 +13024,11 @@ class JiuWenSwarmDeepAdapter:
             # workspace.root_path (~/.jiuwenswarm/agent/workspace).
             deep_config.cwd = task_cwd
             deep_config.project_root = task_workspace
-        self._seed_runtime_cwd(task_cwd, workspace=task_workspace)
+        # ``_reseed_runtime_cwd`` rather than ``_seed_runtime_cwd``: the session's
+        # TaskScheduler is already running by now and holds the CwdState this
+        # adapter seeded at construction, so only a mutation of that object
+        # reaches it.
+        self._reseed_runtime_cwd(task_cwd, workspace=task_workspace)
         if runtime_paths is not None and runtime_paths.is_projectless:
             setattr(self._instance, "_jiuwenswarm_project_dir", task_workspace)
         resolved_language = self._resolve_runtime_language()
@@ -15326,6 +16267,7 @@ class JiuWenSwarmDeepAdapter:
                 vision_tool_available=(
                     getattr(self, "_vision_model_config", None) is not None
                 ),
+                language=self._resolve_runtime_language(),
             )
             inputs = self._prepare_react_image_tool_prompt(
                 request,
@@ -15462,6 +16404,15 @@ class JiuWenSwarmDeepAdapter:
                                             or parsed.get("code")
                                             or event_type
                                         )
+                            elif event_type == "chat.ask_user_question":
+                                # A non-streaming round answers with one text
+                                # payload, so an approval prompt reaching it can
+                                # only be delivered as text. Dropping it would
+                                # end the round with empty content while the
+                                # agent goes on waiting for the answer.
+                                prompt_text = render_prompt_as_text(parsed)
+                                if prompt_text:
+                                    collected_content.append(prompt_text)
                 else:
                     parsed = await run_stream_parser(
                         self._parse_stream_chunk,
@@ -15829,6 +16780,7 @@ class JiuWenSwarmDeepAdapter:
                 vision_tool_available=(
                     getattr(self, "_vision_model_config", None) is not None
                 ),
+                language=self._resolve_runtime_language(),
             )
             inputs = self._prepare_react_image_tool_prompt(
                 request,
@@ -16286,6 +17238,7 @@ class JiuWenSwarmDeepAdapter:
                 vision_tool_available=(
                     getattr(self, "_vision_model_config", None) is not None
                 ),
+                language=self._resolve_runtime_language(),
             )
             inputs = self._prepare_react_image_tool_prompt(
                 request,

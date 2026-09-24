@@ -108,6 +108,12 @@ def _adapter(model_name: str, *, native_image_input: bool) -> JiuWenSwarmDeepAda
             model_config=SimpleNamespace(model_name=model_name)
         )
     )
+    # The notice is localised, so its wording follows ``preferred_language``.
+    # These tests assert the Chinese copy verbatim and are about the notice
+    # reaching a non-streaming caller at all, not about which language it is
+    # in -- so pin the language rather than let the host's installed config
+    # decide it. Without this the file passes or fails by machine.
+    adapter._resolve_runtime_language = MagicMock(return_value="cn")
     adapter._apply_model_to_react_agent = MagicMock()
     adapter._mark_session_active = MagicMock()
     adapter._unmark_session_active = MagicMock()

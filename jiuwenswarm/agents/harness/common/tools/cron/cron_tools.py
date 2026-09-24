@@ -13,6 +13,10 @@ from zoneinfo import ZoneInfo
 from openjiuwen.core.foundation.tool import LocalFunction, Tool, ToolCard
 from jiuwenswarm.runtime.cron.cron_expr import normalize_cron_expr
 from jiuwenswarm.runtime.cron.store import CronJobStore, _PROACTIVE_TICK_MODE
+from jiuwenswarm.common.slack_routing import (
+    slack_cron_session_is_trusted,
+    warn_if_slack_cron_delivery_unreachable,
+)
 from jiuwenswarm.runtime.cron.models import (
     CronJob,
     CronTargetChannel,
@@ -413,6 +417,8 @@ class CronTools:
             return normalize_target_channel_id(channel_raw, default=CronTargetChannel.WEB.value)
         if channel.startswith("feishu"):
             return CronTargetChannel.FEISHU.value
+        if channel.startswith("slack"):
+            return CronTargetChannel.SLACK.value
         if channel.startswith("wecom"):
             return CronTargetChannel.WECOM.value
         if channel.startswith("xiaoyi"):
@@ -515,6 +521,11 @@ class CronTools:
     async def create_job(self, params: dict[str, Any]) -> Any:
         normalized = dict(params or {})
         normalized.pop("session_id", None)
+        # Dropped for the same reason ``session_id`` is: both arrive inside the
+        # model's tool arguments, and the routing context is taken from the
+        # request instead (see ``self._route()``). A model that asked for a
+        # trusted Slack session would be asking to vouch for itself.
+        normalized.pop("slack_session_trusted", None)
         normalized["targets"] = self._normalize_targets_param(normalized.get("targets"))
         normalized["cron_expr"] = normalize_cron_expr(str(normalized.get("cron_expr") or "").strip())
         targets_str = normalized["targets"]
@@ -531,6 +542,15 @@ class CronTools:
         sid = r.session_id
         if isinstance(sid, str) and sid.strip():
             session_kw["session_id"] = sid.strip()
+            # The session being stored *is* the calling request's session here
+            # -- it was read off the route, not off the params. The check is
+            # still run rather than assumed, so that this path and the gateway
+            # RPC path answer the same question with the same rule.
+            session_kw["slack_session_trusted"] = slack_cron_session_is_trusted(
+                request_channel_id=r.channel_id,
+                request_session_id=r.session_id,
+                job_session_id=sid,
+            )
         chat_type = r.chat_type
         if chat_type:
             session_kw["chat_type"] = chat_type
@@ -589,6 +609,14 @@ class CronTools:
         resolved_project_id = binding.project_id
         work_mode = binding.work_mode
 
+        # Same question the gateway RPC asks, on the same helper: a job the model
+        # aims at Slack from a non-Slack turn has no conversation of its own and
+        # nothing said at creation would otherwise mark it.
+        warn_if_slack_cron_delivery_unreachable(
+            targets=targets_str,
+            session_id=session_kw.get("session_id"),
+            job_id=normalized.get("id"),
+        )
         # Phase 4 单源收敛：AgentServer 不本地持久化 job，仅经 E2A 转发 Gateway 落库。
         # 用 build_job（不落盘）拿到规范化视图（含 round-trip 校验）供返回与转发。
         # user_id：优先工具参数，其次当前请求路由上下文（AgentOS 随 E2A 请求透传），
@@ -600,6 +628,7 @@ class CronTools:
             timezone=str(normalized.get("timezone") or "Asia/Shanghai").strip() or "Asia/Shanghai",
             description=str(normalized.get("description") or ""),
             targets=targets_str,
+            post_as_root=bool(normalized.get("post_as_root", False)),
             enabled=bool(normalized.get("enabled", True)),
             wake_offset_seconds=normalized.get("wake_offset_seconds"),
             delete_after_run=normalized.get("delete_after_run"),
@@ -623,6 +652,7 @@ class CronTools:
     async def update_job(self, job_id: str, patch: dict[str, Any]) -> Any:
         normalized_patch = dict(patch or {})
         normalized_patch.pop("session_id", None)
+        normalized_patch.pop("slack_session_trusted", None)
         if "cron_expr" in normalized_patch:
             normalized_patch["cron_expr"] = normalize_cron_expr(str(normalized_patch["cron_expr"]).strip())
         if "targets" in normalized_patch:
@@ -634,6 +664,15 @@ class CronTools:
                     normalized_patch["session_id"] = sid.strip()
             else:
                 normalized_patch["session_id"] = None
+        if "session_id" in normalized_patch:
+            # Re-established from the patching request, as at creation. The
+            # store clears the flag on any session change, so leaving this out
+            # would quietly revoke a job's history access on an unrelated edit.
+            normalized_patch["slack_session_trusted"] = slack_cron_session_is_trusted(
+                request_channel_id=self._route().channel_id,
+                request_session_id=self._route().session_id,
+                job_session_id=normalized_patch.get("session_id"),
+            )
         if "mode" in normalized_patch:
             normalized_patch["mode"] = normalize_cron_job_mode(normalized_patch.get("mode"))
         if "model_name" in normalized_patch:
@@ -666,6 +705,18 @@ class CronTools:
         if "session_id" in normalized_patch or "targets" in normalized_patch:
             chat_type = self._route().chat_type
             normalized_patch["chat_type"] = chat_type if chat_type else None
+        # ``existing`` is None when the Gateway owns the job and this process
+        # has no snapshot of it; the patch is then all that is known, and the
+        # check reads "slack" off it or says nothing at all.
+        warn_if_slack_cron_delivery_unreachable(
+            targets=normalized_patch.get(
+                "targets", existing.targets if existing is not None else ""
+            ),
+            session_id=normalized_patch.get("session_id")
+            if "session_id" in normalized_patch
+            else (existing.session_id if existing is not None else None),
+            job_id=job_id,
+        )
 
         # Phase 4 单源收敛：不本地持久化，仅经 E2A 转发 Gateway 落库。
         # 返回值 = existing 视图 + patch（None 值表示清除该字段）。
@@ -854,6 +905,8 @@ class CronTools:
             params["project_id"] = str(kwargs.get("project_id") or "").strip()
         if "work_mode" in kwargs and kwargs.get("work_mode") is not None:
             params["work_mode"] = str(kwargs.get("work_mode") or "").strip()
+        if "post_as_root" in kwargs:
+            params["post_as_root"] = bool(kwargs.get("post_as_root"))
         return await self.create_job(params)
 
     async def _update_job_tool(self, job_id: str, patch: dict[str, Any]) -> Any:
@@ -898,7 +951,21 @@ class CronTools:
                         "cron_expr": {"type": "string"},
                         "timezone": {"type": "string"},
                         "description": {"type": "string"},
-                        "targets": {"type": "string"},
+                        "targets": {
+                            "type": "string",
+                            "enum": [e.value for e in CronTargetChannel],
+                            "description": (
+                                "Delivery channel. If omitted, use the current "
+                                "request source channel."
+                            ),
+                        },
+                        "post_as_root": {
+                            "type": "boolean",
+                            "description": (
+                                "Post each scheduled result as a new top-level "
+                                "channel message instead of in the source thread."
+                            ),
+                        },
                         "enabled": {"type": "boolean"},
                         "wake_offset_seconds": {"type": "integer"},
                         "mode": {
@@ -954,7 +1021,7 @@ class CronTools:
                 description=(
                     "Update an existing cron job. Pass job_id and a patch dict with fields to update "
                     "(name, enabled, cron_expr, timezone, description, wake_offset_seconds, "
-                    "targets, mode, model_name, mcp, project_dir, project_id)."
+                    "targets, post_as_root, mode, model_name, mcp, project_dir, project_id)."
                 ),
                 input_params={
                     "type": "object",
@@ -982,7 +1049,15 @@ class CronTools:
                                     "type": "string",
                                     "enum": [e.value for e in CronTargetChannel],
                                     "description": (
-                                        "推送频道：web/tui/feishu/dingtalk/whatsapp/wecom/xiaoyi/wechat"
+                                        "推送频道：web/tui/feishu/slack/dingtalk/"
+                                        "whatsapp/wecom/xiaoyi/wechat"
+                                    ),
+                                },
+                                "post_as_root": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "Post scheduled results as new top-level "
+                                        "channel messages instead of in the source thread."
                                     ),
                                 },
                                 "mode": {

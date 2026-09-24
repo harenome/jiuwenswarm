@@ -1060,15 +1060,652 @@ channels:
     enabled: false
   slack:
     # Slack Bot via Socket Mode. Tokens are created in the Slack app settings.
+    #
+    # One workspace: write the pair here and leave workspaces below empty. This
+    # is the shape every Slack config had before workspaces existed and it is
+    # not deprecated -- it is read as a single workspace and produces the one
+    # connection it always produced.
     bot_token:
     app_token:
+    # Several workspaces in one process: one entry per Slack app, each holding
+    # the token pair that app was issued. Written, this list is what is used and
+    # the bot_token/app_token pair above is ignored (with a warning naming it,
+    # so it can be deleted rather than left looking effective).
+    #
+    # One Slack app per workspace, installed by hand, tokens pasted here. There
+    # is no OAuth flow, no app distribution and no token store: the route this
+    # supports is the one an operator can complete in the Slack app settings.
+    #
+    # Each entry becomes its own connection and its own channel instance, which
+    # is not an implementation detail -- a Socket Mode handler serves exactly
+    # one install and blocks for its lifetime, so a second workspace cannot be a
+    # second handler on the first. It is also what makes the per-workspace state
+    # correct without anyone maintaining it: the bot's own user id, the bot id,
+    # the workspace host an attachment may be downloaded from, and every
+    # per-conversation record belong to one instance each.
+    #
+    # A block holds credentials and nothing else. The four keys below are all
+    # one may set:
+    #   bot_token          - xoxb-…, the app's Web API token
+    #   app_token          - xapp-…, with connections:write, opens the socket
+    #   enabled            - omit and the block is on when both tokens are
+    #                        present, which is the rule the single mapping has
+    #                        always been read by; write false to keep the
+    #                        credentials and stop connecting
+    #   default_channel_id - the conversation a producer with no request
+    #                        metadata falls back to. Per workspace because a
+    #                        channel id names a room in one workspace and
+    #                        nothing at all in another. Omitted, the
+    #                        connector-wide default_channel_id below is used.
+    # Any other key written inside a block is ignored, and says so in the log.
+    #
+    # Every other channels.slack key -- the emoji, the statuses, streaming, the
+    # history policy, the block-kit settings, group_chat_mode -- is one
+    # connector-wide value shared by every workspace. To give one workspace, one
+    # conversation or one person different behaviour, write a scope for it in
+    # the top-level scopes list at the end of this file. Two ways to set one
+    # thing is how a deployment ends up running the value nobody wrote.
+    #
+    # workspaces:
+    #   - bot_token: xoxb-…
+    #     app_token: xapp-…
+    #     default_channel_id: C0ACME
+    #   - bot_token: xoxb-…
+    #     app_token: xapp-…
+    #     default_channel_id: C0OTHER
+    #     enabled: false
+    workspaces: []
     # Slack user IDs allowed to use the bot. Empty allows all users.
     allow_from: []
     # Channel IDs allowed to mention the bot. Empty allows all channels.
     allowed_channel_ids: []
+    # Whose app-posted messages this connector reads. Everything an app touches
+    # carries a bot_id -- including a message a *person* posted through an app
+    # holding a user token, where the user field is that person and is correct
+    # and the bot_id is only the app that issued the token. One word for the
+    # whole connector, widening downwards:
+    #   none   - no app message is read (default). Anything carrying a bot_id is
+    #            dropped before a trigger is even looked for, which is why
+    #            nothing a workflow, an integration or another bot posts can
+    #            reach the agent.
+    #   listed - only apps whose app_id is written in app_messages_from below.
+    #   all    - every app, whatever it is and whoever installed it.
+    # Shipped as none, so an upgrade into this key changes no behaviour.
+    #
+    # Two things no word here can readmit. This bot's own messages are refused
+    # under all three, matched on the bot id as well as the user id, and an app
+    # message is refused outright while neither of those is known -- under "all"
+    # that refusal is the only thing between the connector and answering itself,
+    # so it does not depend on a startup call having succeeded. And a message
+    # with no user field is refused whatever word is set: an app posting as
+    # itself names nobody to attribute it to, and every identity rule below this
+    # point -- allow_from, the scopes' user axis, the session key -- needs a
+    # sender. An app posting through its own bot user does carry one, and that
+    # is the shape a word here admits; an incoming webhook carries subtype:
+    # bot_message and no user at all.
+    #
+    # Adding an app is a trust decision and not a convenience. Every message it
+    # posts, anywhere this bot can see it, becomes agent-visible from then on
+    # and is handled as the message of whoever the user field names, with that
+    # person's allow_from entry, their scopes and their session. Nothing is
+    # reattributed, because nothing needs to be: the user field already names
+    # the right person.
+    #
+    # One word for the connector rather than a scope key, because this decides
+    # whether a message is seen at all -- nearer a security boundary than a
+    # preference, and the security-adjacent sections below are deliberately not
+    # freely addressable either. A per-conversation version can be added later
+    # as a scope key without these three words changing.
+    app_messages: none
+    # The apps "app_messages: listed" admits, by app_id.
+    #
+    # Read under that word and no other. Entries left here while app_messages is
+    # none admit nothing, and under all they narrow nothing -- all means all,
+    # and there is deliberately no deny list to pair with it. Nothing is emptied
+    # when the word moves, so an operator can drop to none and come back without
+    # retyping what they had decided.
+    #
+    # Write app ids (A…), never bot ids (B…). An app_id is global to the app and
+    # is the same string in every workspace it is installed in; a bot_id and the
+    # bot user id are created per installation, so reinstalling the app changes
+    # them and a list written against a bot_id quietly stops matching. Find an
+    # app's id in the URL of its settings page (api.slack.com/apps/A0123456789),
+    # or read it off a message the app posted: conversations.history returns
+    # app_id beside bot_id on every one of them. An id naming no app is not an
+    # error -- it simply never matches.
+    app_messages_from: []
+    # How far the Slack history tool may read. One word for the whole
+    # connector, widening downwards:
+    #   disabled - no history tool at all (default)
+    #   origin   - the conversation the request arrived in, and only that one.
+    #              The tool declares no target argument, so nothing the model
+    #              writes can choose a conversation, and it costs no membership
+    #              lookup at all.
+    #   members  - a request may name another conversation T. Every named one is
+    #              checked, at read time, against everybody in the conversation
+    #              the request arrived in: they must all be in T as well. Read it
+    #              as "nobody here learns anything they could not already learn",
+    #              because the answer is posted here in front of all of them. A
+    #              direct message is the same rule in its smallest form -- the
+    #              one person and the bot must both be in T.
+    #   visible  - as members, except that for a target which is a public
+    #              channel the question asked about each person here is
+    #              whether they could read T themselves, not whether they are
+    #              in it. Joining a public channel is self-serve for a full
+    #              member of the workspace, so being absent from one is not
+    #              being unable to read it. A guest cannot join, and neither
+    #              can anybody Slack does not report as a full member of this
+    #              workspace -- an application, because what an app's token may
+    #              read is decided by scopes nothing here can see, and somebody
+    #              reaching a shared channel from another organisation. It
+    #              costs one users.info lookup per person who is missing,
+    #              bounded by history_max_user_lookups below.
+    #   open     - as members, except that a target which is a public channel
+    #              skips the check entirely, guests included. Public
+    #              membership is self-serve, so its content was already
+    #              reachable by anyone who cared to join. The cheap word: it
+    #              reads no member list and no directory entry at all.
+    #              A public *source* earns nothing under any word: somebody can
+    #              join it later and read the answer out of the scrollback.
+    # A refusal names the members that blocked it, so it can be acted on --
+    # except under visible, where the set has been narrowed by what each person
+    # is and naming it would publish who is a guest. There it reports how many.
+    # The narrowest word is "disabled" and not "off" because YAML 1.1 -- which
+    # is what this file is read with -- resolves a bare off to the boolean
+    # false. Written that way it would be the one word of the five an operator
+    # could not write without quoting it.
+    history: disabled
+    # Conversations that may never be read as a target, whoever asks. Checked
+    # before any membership is fetched, so a conversation excluded here is never
+    # enumerated in order to be refused. It does not stop a conversation being
+    # read as the one the request arrived in: reading a room to the room itself
+    # discloses to exactly the people already there.
+    history_never_read: []
+    # Members whose presence does not block the check above. For workspace-wide
+    # integrations that sit in every channel and would otherwise refuse every
+    # read. Ids rather than an exclude_bots switch, so that what was decided can
+    # be read back and audited; a switch would silently cover every integration
+    # added afterwards. This is also the whole of what an application gets
+    # under history: visible -- that word relaxes a public target for anybody
+    # who could have reached it alone, and for an application Slack reports
+    # nothing that would establish it, so an app goes on blocking until
+    # somebody names it here.
+    # The person asking is never exempted by this list -- they are added back
+    # after it is applied, because their own membership of T is the one thing
+    # that is definitionally required.
+    history_exempt_members: []
+    # How far the Slack posting tools may write. One word for the whole
+    # connector, widening downwards:
+    #   disabled - no posting tool at all (default)
+    #   origin   - the conversation the request arrived in, and only that one.
+    #              The three cards declare no chat_id, so nothing the model
+    #              writes can choose a conversation.
+    #   members  - a request may name another conversation T. Everybody in T
+    #              must already be in the conversation the request came from:
+    #              post only where everyone who will see it could already have
+    #              seen the conversation it came from. A target that reaches
+    #              anybody else is not refused -- it is put to the person who
+    #              started the turn, stating how many people outside this
+    #              conversation would see it, and written only if they agree.
+    #              On a turn an event woke, that person is whoever did the
+    #              thing the event reports. A scheduled run has nobody to
+    #              ask, so there a widening target is refused instead.
+    #   open     - any conversation may be named, and nothing is confirmed.
+    # A separate key from history, and it has to be: the widest word inverts
+    # between the two. A public target is the safest case for a read -- its
+    # membership is self-serve, so the content was already reachable -- and the
+    # widest possible audience for a write. One word cannot mean both.
+    # Deleting never asks. It removes a message and widens nothing, so there is
+    # no audience question to put; it still obeys disabled and origin, which say
+    # where the bot may act at all.
+    # The narrowest word is "disabled" and not "off" for the same reason it is
+    # under history: YAML 1.1 resolves a bare off to the boolean false.
+    write: disabled
+    # Deprecated predecessor of history above, kept so an existing config keeps
+    # working and so that a config upgrade against this template does not delete
+    # an operator's list. history wins whenever it names a word, so this is read
+    # only by a config that has no history set:
+    #   []            -> history: disabled
+    #   ["*"]         -> history: origin
+    #   ["C0A","C0B"] -> history: disabled, and a warning. history is one word
+    #                    for the whole connector, so per-conversation history
+    #                    is no longer expressible; write history: origin to
+    #                    restore it for every conversation.
+    # Setting history is the way to stop the deprecation warning.
+    history_digest_channel_ids: []
+    # Bounds on a single read_slack_conversation call, used when these are left
+    # empty. They assume a reader with room for them: a full scan of a busy
+    # channel can run to six figures of characters, which a smaller model
+    # context cannot hold and which the context engine will offload, replacing
+    # the messages the model just asked for with a summary of them. Lower
+    # history_max_messages where that happens -- a call that stops at a bound
+    # reports where it stopped, and the model walks the rest of the channel in
+    # further calls. The model may ask for fewer than these allow, never more.
+    #
+    # history_max_messages is the one worth tuning. The rest bound the scan
+    # rather than the answer, and exist so that a pathological channel cannot
+    # make one tool call run unboundedly.
+    history_max_messages: 2000
+    # Characters of message text and attachment/reaction labels, across the
+    # whole call. Note this counts the text, not the JSON around it, so the
+    # payload a model receives is roughly twice this.
+    history_max_total_chars: 200000
+    # Characters kept from any one message before its text is elided.
+    history_max_message_chars: 4000
+    # Thread roots examined, Slack API calls made, and users.info lookups spent
+    # per call. The lookup budget pays for two things: resolving display names
+    # in the answer, and -- under history: visible -- asking Slack whether each
+    # person missing from a public target could have read it themselves. A
+    # blocking set larger than this budget is a question that could not be
+    # finished, so the read is refused rather than allowed; 0 means the tool
+    # makes no directory lookups at all, which leaves visible unable to
+    # establish anything and refusing every public target.
+    history_max_roots_scanned: 10000
+    history_max_api_calls: 200
+    history_max_user_lookups: 50
+    # Wall-clock seconds one scan may take before it returns what it has.
+    history_scan_timeout_seconds: 90
+    # Seconds one conversation's member list is believed for. Read only when
+    # history above allows reading another conversation, and it is the input to
+    # a refusal, so a stale copy is wrong for at most this long. Lengthen it
+    # where memberships change rarely and channels are large enough that
+    # paginating them costs real API calls; shorten it where removing somebody
+    # from a channel has to take effect immediately.
+    history_members_cache_seconds: 60
+    # Offer the agent a second, separate Slack tool that searches the workspace
+    # by relevance instead of reading one conversation in order. It answers a
+    # different question -- "where was this discussed" rather than "what was
+    # said here" -- and neither tool stands in for the other: a turn that
+    # cannot search is told so and is never handed history instead.
+    #
+    # Off by default, because it needs four things and only the first three can
+    # be arranged in advance:
+    #   * the search:read.public scope on the bot token, which means
+    #     reinstalling the app after adding it;
+    #   * message search enabled for the workspace;
+    #   * a plan tier that offers it;
+    #   * a permission Slack issues per inbound message, which exists only for
+    #     a message that addressed the bot -- a direct message, or a channel
+    #     message that @mentions it.
+    # That last one is why a scheduled job can never search, whatever is set
+    # here: a cron run has no inbound message and therefore no permission. Such
+    # a run is told the tool is unavailable rather than quietly given history.
+    #
+    # Only public channels are searched, and only public results are returned,
+    # whatever the query asks for -- including the conversation the request came
+    # from, if that is a direct message or a private channel. This is the whole
+    # of the tool's authorization: the search is matched inside Slack, so there
+    # is no candidate set here to check membership against, and confining it to
+    # what anyone in the workspace could already read is what makes the answer
+    # safe to post wherever it was asked for.
+    search_enabled: false
     # Optional fallback channel for messages without request metadata.
+    # The connector-wide value: a workspace block that names no
+    # default_channel_id of its own inherits this one. With more than one
+    # workspace configured that is rarely what is wanted, since a channel id
+    # names a room in one workspace and nothing at all in another -- set it per
+    # block there and leave this empty.
     default_channel_id:
     reply_in_thread: true
+    # What the bot reads in channels (direct messages are never affected):
+    #   mention - only @mentions (default)
+    #   reply   - the above, plus thread replies under the bot's own messages
+    #   all     - the above, plus every other channel message
+    #   off     - nothing in channels, not even @mentions
+    # An unquoted off is the YAML boolean false and is read back as this key's
+    # off, so it means what it looks like either way. An unrecognised word falls
+    # back to the default.
+    # Unlike the Telegram field of the same name these are cumulative: Slack
+    # delivers mentions through a separate app_mention subscription, so "reply"
+    # and "all" keep answering mentions rather than replacing them.
+    # This is the connector-wide default. To give one channel a different set,
+    # or a standing prompt, or its own model, write a scope for it -- see the
+    # scopes block at the end of this file.
+    group_chat_mode: mention
+    # How to confirm an accepted request before agent processing begins:
+    #   reaction - add acknowledgement_emoji to the request (default, quietest)
+    #   text     - post acknowledgement_text as a reply
+    #   both     - do both
+    #   off      - no acknowledgement
+    # An unquoted off is the YAML boolean false and is read back as this key's
+    # off, so it means what it looks like either way. An unrecognised word falls
+    # back to the default with a warning.
+    acknowledge_mode: reaction
+    # Deprecated predecessor of acknowledge_mode, kept so an existing config
+    # keeps working: true means text, false means off. acknowledge_mode wins
+    # whenever it names a mode, so this is only read by a config that has no
+    # mode set, and setting acknowledge_mode is the way to stop the deprecation
+    # warning. Left empty rather than false so a config upgrade against this
+    # template keeps an operator's own true or false; a value-less key is read
+    # as unset.
+    acknowledge_requests:
+    acknowledgement_text: "Received. Analyzing…"
+    # The line Slack draws in the thread while the turn is running -- the rung
+    # between the acknowledgement above, which is instant, and the activity
+    # card below, which waits activity_card_delay_seconds before it appears at
+    # all. Free text; Slack shows it beside a spinner.
+    #
+    # Cleared by the connector itself at every point a turn can end -- a reply
+    # posted, a silent finish, an error, a stop, a supersede -- rather than left
+    # to clear itself. Slack does drop the status the instant the app posts
+    # into that thread, which used to be trusted as the only clear needed, but
+    # delivery.reply: optional broke that: a turn whose reply is the NO_REPLY
+    # sentinel posts nothing into the thread, so nothing drops the status but
+    # this explicit clear. Without it a silent turn's status would stand until
+    # Slack's own timeout, two minutes after it was set -- real, but far
+    # slower than a reader watching the thread notices. So a fast turn still
+    # shows this briefly and a long one still has the activity card by the
+    # time it clears, whether or not the turn replied, and there is still
+    # nothing here an operator has to clean up -- the connector does it,
+    # whichever way the turn ends. The clear is best-effort like the status
+    # itself: on a workspace or token that refuses it, Slack's own timeout
+    # remains the backstop.
+    #
+    # Blank to turn it off. It also follows acknowledge_mode: off there is off
+    # here too. It is added to the reaction rather than replacing it, so a
+    # workspace that will not draw it loses nothing.
+    #
+    # Needs a thread to be drawn in, which is the same condition the streamed
+    # preview has: a DM answered at the top of the conversation gets no status
+    # and keeps its reaction.
+    thinking_status: "is thinking…"
+    # Two siblings of thinking_status, drawn into the same slot rather than a
+    # second one: Slack holds one status per thread, so whichever of the three
+    # was set most recently is what a reader sees, and each is set at the
+    # moment it becomes true.
+    #
+    # queued_status replaces thinking_status the instant a message is held
+    # rather than run, because it arrived while that conversation was already
+    # working and delivery.mid_turn is queue there. Without it the thread kept
+    # claiming to be thinking about a message that was, in fact, waiting
+    # behind another one -- the same contradiction the hourglass reaction next
+    # to it would otherwise be the only correct account of.
+    #
+    # steered_status replaces it the instant a message is folded into a turn
+    # already running, under delivery.mid_turn: steer. Nothing new started --
+    # an already-running turn absorbed this message -- so "is thinking…" was
+    # never wrong for the room, only for what caused this particular status
+    # update.
+    #
+    # Neither has an off switch of its own the way thinking_status does: blank
+    # here falls back to the default rather than turning the status off, the
+    # same as queued_emoji and the other reaction keys below. Turn all three
+    # thread statuses off together with acknowledge_mode: off.
+    #
+    # Third person throughout, deliberately: the status is drawn for the whole
+    # thread to read, not addressed to whoever sent the message that caused
+    # it, so "has queued your message" would misstate whose message a second
+    # reader in the same thread is looking at.
+    queued_status: "has queued a message"
+    steered_status: "has steered a message into the running turn"
+    # Level for the slack_bolt and slack_sdk logger trees: CRITICAL, ERROR,
+    # WARNING (default), INFO or DEBUG. Those two sit outside the jiuwenswarm
+    # logger namespace, so without this they have no handler at all and
+    # everything they report -- including the exceptions slack_bolt catches on
+    # a listener's behalf -- goes nowhere. Setting it points them at the same
+    # handlers, and the same redaction, as every other log in the process.
+    #
+    # Its own key rather than logging.level because they are far chattier:
+    # DEBUG writes a line per websocket frame and per dispatched envelope,
+    # which answers "did Slack actually send us that message?" and is not
+    # something to leave on. Note that logging.console and logging.full still
+    # have to allow the level for it to appear; the channel logs the resulting
+    # floor when it starts.
+    sdk_log_level: WARNING
+    # Emoji names without the surrounding colons. Reactions need reactions:write.
+    #
+    # Six keys for six states a message can be in: running, waiting, finished,
+    # broken, halted, never taken. Each is a key rather than a built-in constant
+    # so that an operator who finds a mark ambiguous in their workspace -- an
+    # emoji their team already uses for something else, a custom one that reads
+    # better -- changes one line here instead of waiting for a release.
+    #
+    # The defaults are picked apart by shape, not by colour: ring, hourglass,
+    # tick, cross, square, barred circle. A reaction is drawn small and a reader
+    # scanning a conversation sees the outline first, and some readers cannot
+    # use colour at all. A replacement is worth choosing on the same basis.
+    #
+    # Writing "disabled" in place of a name turns that one mark off and leaves
+    # the other five working -- the tick below is the usual one to drop, but
+    # the word is read the same way for all six. Leaving a key blank does not
+    # do this: an empty value falls back to the default beside it, here and for
+    # queued_status and steered_status above. To remove every mark at once, and
+    # the thread statuses with them, set acknowledge_mode: off instead.
+    #
+    # "disabled" and not "off" for the reason history and write further down
+    # spell their narrowest word the same way: this file is read as YAML 1.1,
+    # which resolves a bare off to the boolean false, so it is the one spelling
+    # an operator could not write without quoting it. A workspace that really
+    # does have a custom emoji named disabled asks for it as :disabled:, colons
+    # included -- the word is matched before the colons are stripped.
+    #
+    # A silenced ending still clears the acknowledgement when the turn stops,
+    # so completed_emoji: disabled leaves a finished message bare rather than
+    # wearing the "seen" mark for good.
+    acknowledgement_emoji: eyes
+    # Added when a request is refused: by allow_from, or because the
+    # conversation is holding as many waiting messages as it may.
+    rejected_emoji: no_entry_sign
+    # Added when a message is held rather than run -- it arrived while that
+    # conversation was already working, and the conversation is configured to
+    # wait for the turn to end instead of interrupting it. Removed again when
+    # the held message is dispatched. A conversation left unconfigured holds
+    # messages, so this is reached without anyone setting delivery.mid_turn.
+    queued_emoji: hourglass_flowing_sand
+    # The three endings, each added when the turn stops and each replacing
+    # acknowledgement_emoji, so the mark on a message states an outcome rather
+    # than the moment it was seen. Without them the acknowledgement is the only
+    # mark a message ever gets and it stays for good, so a conversation the bot
+    # works through all day ends up a column of identical emoji that separates a
+    # turn still running from one that finished hours ago.
+    #
+    # completed_emoji is added whether or not the turn replied. A turn that read
+    # the thread, decided nothing needed saying and stopped is a success, and
+    # this is the only trace of it the channel will ever hold. A tick rather
+    # than a boxed tick because every processed message gets one, and a wall of
+    # green boxes is louder than the fact deserves.
+    #
+    # failed_emoji is separate from rejected_emoji on purpose. Refused means the
+    # request never started -- nothing ran, nothing changed, and the same
+    # message may go through later. Failed means the turn started, may have
+    # called tools and made outbound requests, and then broke: side effects may
+    # exist and someone needs to look. A plain cross rather than a fire or an
+    # explosion, both of which already read as approval or as a joke in chat.
+    #
+    # stopped_emoji is a halted turn: nothing broke and it was not refused, it
+    # ran and was deliberately destroyed. Either somebody pressed the stop
+    # button, or a later message superseded it under delivery.mid_turn: cancel.
+    # One mark for both, because the reader's next step is the same either way:
+    # it did not finish, nothing further is coming, ask again if it is still
+    # wanted. A media square rather than a stop sign, because the octagon reads
+    # as "blocked", which is what rejected_emoji above already means.
+    #
+    # All three are reaction-only and follow acknowledge_mode, so a deployment
+    # on text or off gains no reactions from them.
+    completed_emoji: heavy_check_mark
+    failed_emoji: x
+    stopped_emoji: black_square_for_stop
+    # Show the reply as it is written, rather than posting it once when the
+    # turn ends. A preview costs API calls from the channel's own budget and
+    # produces churn everyone in a shared channel can see, and a scheduled push
+    # has no reader waiting on it, so this is off by default.
+    #
+    # How the preview is written is not configured here. Slack has two ways of
+    # doing it and only one works for any given reply -- the newer one needs a
+    # thread to reply into, which a DM answered at the top of the conversation
+    # does not have -- so the choice is made per reply against what Slack will
+    # accept. Turning this on asks for the best available.
+    #
+    # Approval buttons are only ever shown on a previewed turn, so false also
+    # means a task that asks for permission pauses with nothing on screen.
+    enable_streaming: false
+    # Show what a turn is doing as one in-progress card, rewritten in place as
+    # it goes: its todo list, the subagents it dispatched, the tools it ran. A
+    # turn that delegates or works through a long tool sequence produces no
+    # output at all while it does so -- the agent is blocked -- so without this
+    # the channel cannot tell a turn that is working from one that has hung.
+    # One card per turn, whatever the width of the work; it reports counts and
+    # names -- how many subagents are running and of which type, which tools
+    # were called -- and never what any of them was asked to do or returned.
+    #
+    # What it reports is harness-side only: that something ran, is running, or
+    # returned. It does not claim the work succeeded. A subagent's own results
+    # never leave the subagent, so a subagent whose commands all failed still
+    # shows as complete -- the subagent itself ran fine.
+    #
+    # Was subagent_status_card, which is still read when this key is absent.
+    activity_card: true
+    # How long a turn has to still be working before the card is worth posting.
+    # A turn that finishes inside this window leaves nothing in the channel at
+    # all. Set to 0 to post as soon as the first tool call arrives.
+    # Was subagent_card_delay_seconds, still read when this key is absent.
+    activity_card_delay_seconds: 5
+    # Floor between two intermediate rewrites of that card, so a long turn
+    # reports progress without spending an edit per tool call. A subagent
+    # returning is never withheld, and neither is the final rewrite: a card is
+    # never left claiming a finished turn is live.
+    # Was subagent_card_min_edit_seconds, still read when this key is absent.
+    activity_card_min_edit_seconds: 10
+    # Post a Markdown table as a Block Kit table instead of as preformatted
+    # text, which is the one thing Slack mrkdwn cannot express. Everything else
+    # in a reply stays mrkdwn either way, and no extra scope is needed: blocks
+    # travel in the same chat.postMessage call as the text.
+    #   auto   -- render any Markdown table in a reply. The default. A reply can
+    #             decline per message with <!-- jiuwenswarm:slack-blocks:off -->.
+    #   marker -- render only when the reply itself asks, by including
+    #             <!-- jiuwenswarm:slack-blocks --> anywhere in the answer.
+    #             Nothing tells the model this marker exists, so this mode does
+    #             nothing at all unless you also put it in front of the model
+    #             yourself, from a skill or a system prompt.
+    #   off    -- never render blocks; the markers are stripped rather than
+    #             posted.
+    # Anything too large for Block Kit's limits is posted as text unchanged.
+    blockkit_tables: auto
+    # Which of Slack's two table blocks a Markdown table becomes, once
+    # blockkit_tables above has allowed blocks at all:
+    #   data_table -- the block that pages, sorts, filters and offers the reader
+    #                 a download. The default, because it is the only value that
+    #                 cannot cost a reply its table: it holds 200 rows and
+    #                 20,000 characters where the plain block holds 100 and
+    #                 10,000, and a table past those limits is posted as raw
+    #                 pipes rather than trimmed. A table shorter than one page
+    #                 is still shown whole, with no pager on screen.
+    #   basic      -- a plain "table": every row at once, and none of the
+    #                 sorting, filtering or download the other one has.
+    #   off        -- no table block at all; the table stays the text it was
+    #                 written as. This is about tables only. A chart or a
+    #                 hand-written ```blockkit fence in the same reply still
+    #                 renders -- blockkit_tables above is what turns those off.
+    # An unquoted off is the YAML boolean false and is read back as this key's
+    # off, so it means what it looks like either way. An unrecognised word falls
+    # back to the default with a warning.
+    # Replaces data_table_row_threshold, which picked between the two blocks by
+    # counting rows -- a number that could only ever choose between them by
+    # accident, since what separates them is what a reader can do with the
+    # table rather than how big it is. A config upgrade rewrites the old key
+    # into this one: 0 becomes data_table, any other row count becomes basic.
+    render_tables: data_table
+    # A reply can also hand over Block Kit JSON it wrote itself, in a
+    # ```blockkit fence, a diagram in a ```mermaid fence, and a chart
+    # specification in a ```vega-lite fence. Five fences decide what is drawn
+    # and nothing else does:
+    #   ```mermaid   -- drawn as a diagram wherever this connector can draw it.
+    #   ```vega-lite -- drawn as a chart, however this connector can draw it.
+    #   ```blockkit  -- drawn as the Block Kit blocks the JSON describes.
+    #   ```slack-raw -- never drawn; shown as the source it holds.
+    #   ```          -- an unnamed fence, likewise never drawn.
+    # The first two are the portable ones: a renderer that has never heard of
+    # Slack still knows both languages, and one that cannot draw the chart shows
+    # a description of it instead. ```blockkit is Slack-only and is the only one
+    # blockkit_allowed_block_types below applies to.
+    # Charts reach Slack from four of those: a mermaid pie, a mermaid
+    # xychart-beta (bar and line), a vega-lite spec (bar, area, line and pie),
+    # and hand-written blockkit. mermaid has no area chart of any kind, so an
+    # area chart comes from vega-lite or blockkit or not at all. Every parser
+    # declines a shape it does not recognise rather than guessing at it: the
+    # fence then stays on screen as the source that was written.
+    # Naming the language is the whole request: there is no marker to add
+    # beside it. The blockkit_tables markers above no longer turn a fence on --
+    # they decide table shape. They can still turn one off: blockkit_tables:
+    # off, blockkit_tables: marker without the marker, and a reply's own
+    # <!-- jiuwenswarm:slack-blocks:off --> each suppress every block in the
+    # reply, fences included.
+    #
+    # Which block types a ```blockkit fence may hold. Empty is the default and
+    # means no restriction, because which types Slack draws is Slack's to say
+    # and changes without JiuwenSwarm hearing about it -- a name missing from a
+    # fixed list costs the whole message its rendering for a block Slack would
+    # have drawn. Name types here to restrict a channel to them, e.g.
+    #   blockkit_allowed_block_types: [data_table, data_visualization]
+    # A value that names nothing usable is logged and read as no restriction.
+    # This is a portability preference -- which blocks your clients render well
+    # -- and not a safety control: it never decides what a reader can click.
+    blockkit_allowed_block_types: []
+    # Whether a ```blockkit fence may hold buttons, selects, date pickers and
+    # other elements that post back to this app. False, and deliberately a
+    # separate key from the list above.
+    #
+    # JiuwenSwarm posts real permission-approval buttons into these same
+    # channels. A reader cannot tell a button a reply drew from a button the
+    # approval flow drew -- they are the same pixels, and clicking either sends
+    # an interaction to this app. So widening which block types may be drawn
+    # must not also widen what a reader can be asked to click. Turning this on
+    # is a separate decision.
+    # Anything that is not a boolean is logged and read as false.
+    blockkit_allow_interactive: false
+    # Which Block Kit payloads are checked with Slack's blocks.validate method
+    # before they are sent. One of off | risky | all; risky is the default.
+    #
+    # A send that Slack refuses reports "invalid_blocks" and nothing else, which
+    # says something in the payload was wrong and never which thing.
+    # blocks.validate answers the same question in advance and, on a refusal,
+    # answers with a JSON pointer to the offending element -- so the reader can
+    # be shown what failed and where instead of silently losing the formatting.
+    # It renders nothing, posts nothing and needs no extra scope.
+    #
+    # It does cost an API call, and Slack rates the method "Special" without
+    # publishing a number. The limit is per method, per workspace, per app, so
+    # validation spends from its own budget and cannot slow down message
+    # delivery however hard it is used.
+    #
+    #   off   -- never call it: a refused payload is retried as plain text.
+    #   risky -- call it for the payloads a refusal comes from in practice: a
+    #            reply's own ```blockkit fence, any message holding controls
+    #            to click, and anything unusually large. Everything else is
+    #            built here by typed code and is sent unchecked.
+    #   all   -- call it for every message that holds blocks.
+    #
+    # Whatever the setting, a validation that fails, times out or is rate
+    # limited is never retried and never delays a message: the payload is sent
+    # as it would have been sent anyway, and the after-the-fact fallback still
+    # catches a refusal.
+    blockkit_validate: risky
+    # Group digital avatar (off by default). When on, channel messages also go
+    # through the shared IM pipeline, which asks a model whether each one
+    # concerns my_user_id and, for replies, whether the answer belongs in the
+    # channel or in a DM. Direct messages to the bot are never affected.
+    #
+    # Only useful with group_chat_mode: all, since the pipeline's job is to
+    # filter the channel traffic the bot sees, and the other modes have already
+    # narrowed that to mentions or thread replies. In that combination consider
+    # acknowledge_mode: off as well, or the bot reacts to every message in the
+    # channel including the ones it decides not to answer.
+    #
+    # Requires my_user_id; the avatar stays off without it. Reading channel
+    # history needs channels:history (or groups:history), and resolving display
+    # names needs users:read.
+    group_digital_avatar: false
+    # Slack user ID of the person the avatar speaks for, e.g. U01ABCDEF.
+    my_user_id: ""
+    # Display name for that person. Resolved from users.info when left empty.
+    principal_name: ""
+    # Bot display name, used to spot a plain-text "@name" mention that Slack
+    # did not turn into a link.
+    bot_name: ""
+    enable_memory: false
+    # Offer the send_file tool to agents answering on Slack. Uploads need
+    # files:write on the bot token; set false to withhold the tool entirely.
+    send_file_allowed: true
     enabled: false
   whatsapp:
     # WhatsApp 配置（通过本地 Baileys bridge）
@@ -1173,7 +1810,17 @@ channels:
 # with chat_type: -- a rule for every direct message, or for every group room,
 # written once and needing no edit when a new one is opened. The kinds are each
 # platform's own words, listed per connector below, and a kind a platform does
-# not have is reported at startup and matches nothing.
+# not have is reported at startup and matches nothing. On Slack they are
+# channel, group, im and mpim -- a public channel, a private one, a one-to-one
+# direct message and a group direct message:
+#
+#   match: {channel: slack, chat_type: im}
+#     every one-to-one direct message with the bot
+#   match: {channel: slack, chat_type: channel}
+#     every public channel, and no private one -- Slack sends a private
+#     channel as "group", so this is narrower than it reads
+#   match: {channel: slack, chat_type: [channel, group]}
+#     every channel, public or private, and no direct message
 #
 # One kind or a list of them, and a list ORs: the rule fires for a conversation
 # of any kind it names, and for no other. That is how a rule about a class of
@@ -1257,6 +1904,9 @@ channels:
 #                   session       how much of a channel shares one conversation
 #                   reply         whether a turn in that conversation owes an
 #                                 answer
+#                   events        which non-message Slack events that
+#                                 conversation keeps for its next turn, or
+#                                 starts a turn over
 #   agent         the runtime: how the turn is run
 #                   model_name    the model that conversation's turns run on
 #                   history       how far the Slack history tool may read
@@ -1276,18 +1926,21 @@ channels:
 #   conversations, and any one of them matching is enough:
 #     mention  - the bot is @mentioned
 #     reply    - a thread reply under a message the bot itself started
-#     all      - every channel message
+#     all      - every channel message, @mentions of the bot included
 #     url      - the message contains an http(s) link
 #     has_file - the message has an attachment
-#   "mention" is NOT implicit: a mode that omits it means the bot ignores
-#   @mentions in that conversation, which is a legitimate ingest-only setup but
-#   is far more often a slip, so it is logged as a warning naming the
-#   conversation. An empty list means the bot answers nothing there. An entry
-#   that is not one of the five above refuses the whole list with a warning,
-#   which leaves that conversation on the layer below rather than on a set
-#   nobody wrote. One misspelled trigger therefore drops the rule entirely,
-#   and with group_chat_mode: all on the layer below that leaves the
-#   conversation answering more than the rule asked for.
+#   "mention" is NOT implicit, and "all" is the one entry that supplies it: a
+#   mode naming neither means the bot ignores @mentions in that conversation,
+#   which is a legitimate ingest-only setup but is far more often a slip, so it
+#   is logged as a warning naming the conversation. Listing "mention" beside
+#   "all" changes nothing and is not warned about, because "+all" written on a
+#   conversation that already answers mentions composes to exactly that.
+#   An empty list means the bot answers nothing there. An entry that is not one
+#   of the five above refuses the whole list with a warning, which leaves that
+#   conversation on the layer below rather than on a set nobody wrote. One
+#   misspelled trigger therefore drops the rule entirely, and with
+#   group_chat_mode: all on the layer below that leaves the conversation
+#   answering more than the rule asked for.
 #
 #   delivery.prompt is appended to every message that triggers there, after the
 #   user's own text. Whenever a prompt is appended it is preceded by a line
@@ -1397,6 +2050,186 @@ channels:
 #                conversation reading every link posted in it can want an
 #                analysis of each, or silence unless one is worth flagging,
 #                and mode alone cannot say which.
+#   The mechanism is the connector's, not this file's: a message reaching a
+#   conversation with reply: optional has an instruction appended, invisible
+#   here, telling the model that a reply which is exactly the token NO_REPLY
+#   and nothing else is withheld rather than posted, and any other text is
+#   posted in full. The token is spelled once, in the code both halves read,
+#   so nothing in this config can misspell it or drift from what the matcher
+#   accepts.
+#   Never a direct message, whatever the rule says. An unanswered DM reads as
+#   the bot being broken rather than as a judgement nobody needed to hear --
+#   there is no third party in the room for the silence to spare -- so a rule
+#   naming a DM as optional has no effect there.
+#   It may only be written on a rule that matches the channel or the
+#   conversation, the same restriction delivery.session carries and for the
+#   same shape of reason: whether an answer is owed belongs to the room rather
+#   than to whoever is typing into it, and the reply is matched against the
+#   token on the way out, where nothing says which sender it answers. A rule
+#   that also names a user or a role is reported at startup and the key does
+#   nothing.
+#
+#   delivery.events says what that conversation does with Slack's non-message
+#   events. Reactions, pins and membership changes are state changes rather than
+#   things anybody said, and somebody opening this app's App Home is an arrival
+#   rather than either, so by default none of them reaches the bot at all. A
+#   conversation can ask for them to be recorded where they arrive, with
+#   whatever accumulated folded into the next message that wakes the bot for its
+#   own reasons -- the model can already read reactions with the history tool,
+#   and what that buys is that it sees them without having to think to look. A
+#   conversation can also ask for an event to start a turn by itself, which is
+#   the narrower setting, applies to three of the four families, and is
+#   described under "turn" below.
+#
+#   It is a mapping of families to one of three words:
+#
+#       delivery:
+#         events:
+#           reaction: turn
+#           pin: context
+#           member: off
+#           app_home: context
+#
+#   The four families are reaction, pin, member and app_home. The first three
+#   each cover both directions of one state change: reaction is reaction_added
+#   and reaction_removed together, pin is pin_added and pin_removed, member is
+#   member_joined_channel and member_left_channel. There is deliberately no way
+#   to keep one half -- a room that recorded additions and dropped removals
+#   would show the model the emoji that was taken back and the person who left,
+#   which is worse than showing it neither, because it looks like knowledge.
+#
+#   app_home covers one event type because Slack publishes one: app_home_opened,
+#   which fires every time somebody enters this app's App Home -- the space
+#   holding the Home tab and the direct message with this app -- for either tab.
+#   Slack sends nothing for leaving, so there is no half missing. The record
+#   carries which tab was opened, home or messages, and is filed under the
+#   direct message channel between that person and this app, which is the
+#   conversation the Messages tab already is: a rule naming that conversation,
+#   or naming {chat_type: im}, is what switches it on.
+#
+#   The same fact the other way round is the one trap in this mapping. An App
+#   Home event arrives in that per-user direct message and nowhere else, so a
+#   rule naming a channel never matches one however it is written, while the
+#   other three families all arrive in the conversation they are about and are
+#   matched by such a rule normally. app_home written on a rule matching
+#   {chat_type: channel} or {chat_type: group} is reported at startup, and the
+#   rest of the mapping is kept: a reaction or a pin beside it still does what
+#   it says on that channel. A rule naming one conversation by id gets no such
+#   report, because reading a conversation's kind out of its id is something
+#   this connector deliberately does not do -- so app_home under {chat: C...}
+#   is inert and says nothing. {channel: slack}, the broadest Slack rule, is
+#   the usual home for this family: it matches whatever conversation an event
+#   arrives in.
+#
+#   The three words are:
+#     off     - the event is dropped where it arrives. The default: a family
+#               this mapping does not name is off, and a conversation nobody
+#               wrote a rule for keeps nothing at all.
+#     context - the event is kept, and folded into the next turn.
+#     turn    - the event starts a turn of its own, straight away.
+#
+#   An unquoted off is the YAML boolean false and is read back as this key's
+#   off, so it means what it looks like either way -- which matters more here
+#   than on a key of its own, because a disposition that could not be read
+#   refuses the whole mapping and takes the families spelled correctly beside
+#   it down with it.
+#
+#   Where a woken turn's reply goes depends on what the event was about, and
+#   there is no setting for it:
+#     reaction, pin - in the thread of the message the event was about. A
+#                     reaction names that message, so there is a thread to
+#                     answer in and the answer sits next to what it is about.
+#     member        - at the top level of the channel. A membership change is
+#                     about the room and names no message, so there is no
+#                     thread; the reply goes where a scheduled job's result
+#                     goes, which everybody in the channel sees.
+#
+#   app_home takes off and context only. turn written on it is refused, the
+#   whole mapping is ignored, and a warning names it: a turn woken by somebody
+#   opening a tab has no message to answer, and which destination would even be
+#   coherent depends on which tab was opened: the Messages tab is the direct
+#   message conversation and a reply there is ordinary, while a reply there
+#   because somebody clicked the Home tab answers a question nobody asked. No
+#   family splits its behaviour on a payload field, and nobody has decided that
+#   this one should.
+#
+#   Switching member: turn on is therefore the loudest of the three, and it
+#   covers both halves of the family: member_left_channel as well as
+#   member_joined_channel. A turn started by somebody leaving as well as
+#   somebody joining is what you get, and a comment at the top of the channel
+#   about a departure is a different thing from one greeting an arrival. The
+#   family is not splittable -- see above for why keeping one half of a state
+#   change is worse than keeping neither -- so write the conversation's prompt
+#   with both in mind, or leave member on context.
+#
+#   What a turn woken by an event is told is written in the connector and
+#   nothing here can change it: what kind of event, who did it, which message
+#   it was about where there is one, where its reply would land, that nobody
+#   addressed the bot, and that silence is the right outcome unless this
+#   conversation's own instructions say an event of that kind is a request.
+#   Those instructions are delivery.prompt's job, below. A conversation that
+#   switches turn on and writes no prompt gets a model that reliably says
+#   nothing, which is the intended shape of that configuration rather than a
+#   gap in it.
+#
+#   Five things turn does not do, each of which leaves the event in the buffer
+#   for the next turn instead:
+#     - it does not start a second turn while that conversation is already
+#       working, and does not interrupt one. A burst of reactions produces one
+#       turn at most, and so does a bulk invite of twenty people; the rest are
+#       carried by whatever is running.
+#     - it does not start a turn while somebody has an approval or a question
+#       on screen in that conversation.
+#     - it does not fire where delivery.reply is required, which is the
+#       default. A required reply would oblige the turn to say something about
+#       a reaction nobody asked about, so turn is treated as context until that
+#       conversation is also set to delivery.reply: optional. This is the
+#       conservative reading of two keys that were written separately and is
+#       open to revision.
+#     - it does not fire for an event whose family answers in a message's
+#       thread and which names no message, such as a reaction added to a file.
+#       The channel's top level is the member family's destination, not a
+#       fallback for a reaction that lost its message.
+#     - it does not fire in a direct message, because delivery.reply is never
+#       optional there.
+#
+#   A turn woken by an event can post its reply where the list above says, or
+#   stay silent. There is nowhere else for it to post.
+#
+#   A mapping rather than a list, because a mapping merges per key: a rule on
+#   one conversation naming only pin keeps whatever the rule above it said about
+#   reaction. A family named twice takes the value of the more specific rule, so
+#   a conversation can turn a family the platform rule switched on back off.
+#
+#   What the bot does about an event is not settled here and cannot be: the
+#   folded block states what happened and nothing else. Write the instruction in
+#   the same rule's prompt_append -- "when somebody reacts with :bookmark:, save
+#   the link" -- where you can read it back.
+#
+#   Two bounds apply to the buffer per conversation and are the connector's, not
+#   this file's. They govern what context keeps, and what turn falls back to
+#   keeping whenever it declines to wake one.
+#   Each family holds a limited number of events between two turns, separately
+#   from the others so that a flood of reactions cannot push out the join that
+#   explains who the new person in the room is; past that the oldest go, and the
+#   folded block says how many were dropped rather than quietly holding part of
+#   a burst. app_home holds the fewest of the four, because it fires on every
+#   entry to App Home and every one of its records in a conversation names the
+#   same person: the fifth says nothing the first did not, and the dropped count
+#   reports the volume. Events older than an hour are dropped too and
+#   counted the same way,
+#   because a reaction from yesterday folded into this morning's first turn is
+#   noise whether or not there was room for it. Nothing is written to disk:
+#   restarting the connector forgets whatever a room had collected.
+#
+#   It may only be written on a rule that matches the channel or the
+#   conversation, the same restriction delivery.session and delivery.reply
+#   carry. What a room feeds the model belongs to the room: under context the
+#   events are folded into whichever turn runs next, which need not be a turn of
+#   the sender a rule names, and under turn the event starts a turn nobody sent
+#   a message for. The person who reacted is not a sender either way. A rule
+#   that also names a user or a role is reported at startup and the key does
+#   nothing.
 #
 #   agent.model_name must name one of the models under models.defaults -- either
 #   its "model_name" or its "alias". A name that is not configured is dropped
@@ -1534,6 +2367,11 @@ channels:
 #   and, by default, on the thread in a channel, so the conversations already in
 #   use would never pick it up at all.
 #
+# A conversation a scope names is opted in by that alone. On Slack it is
+# therefore exempt from channels.slack.allowed_channel_ids: both are
+# hand-written ids in this file, and requiring the same conversation in two
+# lists before the bot would answer there is redundancy rather than protection.
+#
 # How a value composes is decided by its type, not by its name:
 #   scalar        replaces        model_name: "deepseek-v3"
 #                                 mid_turn: steer
@@ -1561,6 +2399,8 @@ channels:
 #     - match:    {channel: slack}
 #       delivery: {mode: [mention, url]}
 #       agent:    {history: origin}
+#     - match:    {channel: slack, chat_type: im}
+#       delivery: {mode: [all]}
 #     - match:    {channel: slack, chat: "C000000AAAA"}
 #       delivery:
 #         mode: [+has_file]
@@ -1589,8 +2429,19 @@ channels:
 #
 # A scope that sets only permissions or only clicks does not opt its
 # conversation into being answered: the ids that exempt a Slack channel from
-# allowed_channel_ids come from the delivery and agent sections alone, so a rule
-# written to take something away cannot hand something else out.
+# allowed_channel_ids come from delivery or model/history agent settings, so a
+# rule written to take something away cannot hand something else out.
+# A scope that sets only agent.subagents or agent.skills also does not opt a
+# channel in. Omitted available inherits the global skill library. available: []
+# allows no skills. Clear inherited required skills with required: [] as well.
+# Omitted required loads none when no broader scope set it.
+# Each skills subkey replaces its own list in a more specific scope.
+# To restrict delegation or skill loading in an existing room, add these under
+# its agent: block:
+#   subagents: [research_agent]   # Only these enabled agents are callable.
+#   skills:
+#     available: [ambient, research]  # Skills the agent may load.
+#     required: [ambient]             # Full skill text loaded for every turn.
 #
 # Quote conversation ids, or YAML may reinterpret one that looks numeric.
 # An empty list rather than a bare key: entries are whole rules rather than
@@ -1762,6 +2613,57 @@ permissions:
     heartbeat_run_now: allow
     heartbeat_cancel_run: allow
     acp_chat: ask
+    # Slack canvases: two of the six tools open a door that does not shut, and
+    # neither is listed above, because listing one here would decide for every
+    # deployment what only an operator can decide. Write them in yourself if
+    # the reasoning below applies:
+    #
+    #   delete_slack_canvas: ask
+    #
+    # A canvas it deletes is gone -- Slack keeps no copy, has no undelete, and
+    # tells nobody -- so the tool is worth an ask wherever a canvas holds
+    # anything a person would miss. The same line under a scopes: rule narrows
+    # one conversation rather than the whole deployment, and under
+    # match: {channel: "__cron__"} it is enforced as deny, because a scheduled
+    # run has nobody to answer the question.
+    #
+    # The second door is an argument rather than a tool: share_slack_canvas
+    # with access_level: owner transfers ownership of a canvas to a person, and
+    # nothing gives it back except that person. permissions.tools is keyed by
+    # tool name and cannot see an argument, so narrowing that one means
+    # narrowing share_slack_canvas as a whole -- which also stops every
+    # ordinary read and write grant. Worth doing where ownership matters more
+    # than sharing does; not worth doing by default, which is why it is written
+    # here rather than applied above.
+    #
+    # Slack Lists: the same shape of decision, and none of the five is listed
+    # above for the same reason. Write these in yourself where the reasoning
+    # applies:
+    #
+    #   delete_slack_list: ask
+    #
+    # A List it deletes is gone with every row in it -- Slack keeps no copy and
+    # has no undelete -- and the call behind it is files.delete, which deletes
+    # any file at all. The tool refuses an id Slack does not confirm is a List,
+    # so the capability is no wider than the name; the ask is for the deletion
+    # itself. Under match: {channel: "__cron__"} it is enforced as deny, a
+    # scheduled run having nobody to answer the question.
+    #
+    #   write_slack_list: ask
+    #
+    # Not because creating is destructive but because it is unrepeatable: a
+    # List's columns are fixed at creation and no Slack method changes them
+    # afterwards, so a List created with the wrong ones is abandoned rather
+    # than repaired, and a workspace has a ceiling on how many Lists it may
+    # hold. Worth an ask where that ceiling is close, or where somebody else
+    # curates the workspace's Lists; not worth one by default.
+    #
+    # The third door is an argument rather than a tool: share_slack_list with
+    # access_level: owner transfers ownership to a person, and nothing gives it
+    # back except that person. permissions.tools is keyed by tool name and
+    # cannot see an argument, so narrowing that one means narrowing
+    # share_slack_list as a whole -- which also stops every ordinary read and
+    # write grant.
 
   rules:
     - id: shell_allow_dir

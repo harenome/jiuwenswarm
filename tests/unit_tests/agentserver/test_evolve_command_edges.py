@@ -1012,3 +1012,146 @@ async def test_team_stream_injects_image_tool_context_for_non_vision_model(monke
 
     assert "jiuwenswarm_image_tool_context" in captured["query"]
     assert "agent/sessions/sess-team-image/uploads/persisted.png" in captured["query"]
+
+
+def _image_request(request_id: str = "req-image-notice") -> AgentRequest:
+    return AgentRequest(
+        request_id=request_id,
+        channel_id="web",
+        session_id="sess-image-notice",
+        params={
+            "query": "what does the picture say?",
+            "media_items": [
+                {
+                    "type": "image",
+                    "filename": "persisted.png",
+                    "path": "agent/sessions/sess-image-notice/uploads/persisted.png",
+                    "mime_type": "image/png",
+                }
+            ],
+        },
+    )
+
+
+def _image_model(model_name: str = "Fictional-1B") -> SimpleNamespace:
+    return SimpleNamespace(model_config=SimpleNamespace(model_name=model_name))
+
+
+def test_image_tool_fallback_notice_follows_english_preferred_language():
+    """The notice reaches the user verbatim, so it must honour ``preferred_language``."""
+    notice = JiuWenSwarmDeepAdapter._build_image_tool_fallback_notice(  # pylint: disable=protected-access
+        _image_request(),
+        enable_read_image_multimodal=False,
+        model=_image_model(),
+        vision_tool_available=True,
+        language="en",
+    )
+
+    assert notice is not None
+    assert notice["content"] == (
+        "The current model (Fictional-1B) does not support native image understanding; "
+        "an image understanding tool is used instead."
+    )
+    assert notice["model_name"] == "Fictional-1B"
+
+
+def test_image_tool_fallback_notice_keeps_chinese_default():
+    """The default language keeps the original copy, brackets included."""
+    notice = JiuWenSwarmDeepAdapter._build_image_tool_fallback_notice(  # pylint: disable=protected-access
+        _image_request(),
+        enable_read_image_multimodal=False,
+        model=_image_model(),
+        vision_tool_available=True,
+        language="cn",
+    )
+
+    assert notice is not None
+    assert notice["content"] == (
+        "当前模型（Fictional-1B）不支持原生图片理解，已切换为图片理解工具处理。"
+    )
+
+
+def test_image_tool_fallback_notice_omits_label_without_model_name():
+    """An unnamed model must not leave empty brackets or a dangling space."""
+    english = JiuWenSwarmDeepAdapter._build_image_tool_fallback_notice(  # pylint: disable=protected-access
+        _image_request(),
+        enable_read_image_multimodal=False,
+        model=_image_model(""),
+        vision_tool_available=True,
+        language="en",
+    )
+    chinese = JiuWenSwarmDeepAdapter._build_image_tool_fallback_notice(  # pylint: disable=protected-access
+        _image_request(),
+        enable_read_image_multimodal=False,
+        model=None,
+        vision_tool_available=True,
+        language="cn",
+    )
+
+    assert english is not None and chinese is not None
+    assert english["content"].startswith("The current model does not support")
+    assert chinese["content"].startswith("当前模型不支持")
+    assert "model_name" not in english
+    assert "model_name" not in chinese
+
+
+@pytest.mark.anyio
+async def test_team_stream_emits_localised_image_tool_fallback_notice(monkeypatch):
+    """The streamed notice chunk states the configured language, not a fixed locale."""
+    adapter = JiuWenSwarmDeepAdapter()
+    adapter._instance = SimpleNamespace()  # pylint: disable=protected-access
+    adapter._is_session_scoped_adapter = True  # pylint: disable=protected-access
+    # A configured image-understanding tool, which is the copy asserted below:
+    # without one the notice says there is no image understanding at all.
+    adapter._vision_model_config = SimpleNamespace()  # pylint: disable=protected-access
+
+    monkeypatch.setattr(adapter, "_has_valid_model_config", lambda _model_name="": True)
+    monkeypatch.setattr(adapter, "_resolve_model_for_request", lambda _request: _image_model())
+    monkeypatch.setattr(
+        adapter, "_apply_model_to_react_agent", lambda _model, **_kwargs: None
+    )
+    monkeypatch.setattr(adapter, "_resolve_runtime_language", lambda: "en")
+    monkeypatch.setattr(adapter, "_native_image_input_enabled", lambda *_args: False)
+    monkeypatch.setattr(adapter, "_write_runtime_state", lambda **_kwargs: None)
+
+    async def _drain_team_inputs(_request, _inputs, _instance):
+        if False:
+            yield None
+
+    from jiuwenswarm.server.runtime.agent_adapter import team_helpers
+
+    monkeypatch.setattr(team_helpers, "process_team_message_stream", _drain_team_inputs)
+
+    request = AgentRequest(
+        request_id="req-team-image-notice",
+        channel_id="web",
+        session_id="sess-team-image-notice",
+        params={
+            "mode": "team",
+            "query": "what does the picture say?",
+            "media_items": [
+                {
+                    "type": "image",
+                    "filename": "persisted.png",
+                    "path": "agent/sessions/sess-team-image-notice/uploads/persisted.png",
+                    "mime_type": "image/png",
+                }
+            ],
+        },
+        is_stream=True,
+    )
+
+    notices = [
+        chunk.payload
+        async for chunk in adapter.process_message_stream_impl(
+            request, {"query": "what does the picture say?"}
+        )
+        if isinstance(chunk.payload, dict)
+        and chunk.payload.get("notice_type") == "image_tool_fallback"
+    ]
+
+    assert len(notices) == 1
+    assert notices[0]["content"] == (
+        "The current model (Fictional-1B) does not support native image understanding; "
+        "an image understanding tool is used instead."
+    )

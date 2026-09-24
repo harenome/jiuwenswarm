@@ -156,6 +156,7 @@ class EtcdCronJobStore:
         timezone: str,
         description: str,
         targets: str,
+        post_as_root: bool = False,
         enabled: bool = True,
         wake_offset_seconds: int | None = None,
         session_id: str | None = None,
@@ -168,6 +169,7 @@ class EtcdCronJobStore:
         app_id: str = "",
         work_mode: str = DEFAULT_WEB_WORK_MODE,
         user_id: str = "",
+        slack_session_trusted: bool = False,
     ) -> CronJob:
         job = build_new_cron_job(
             job_id=job_id,
@@ -176,6 +178,7 @@ class EtcdCronJobStore:
             timezone=timezone,
             description=description,
             targets=targets,
+            post_as_root=post_as_root,
             enabled=enabled,
             wake_offset_seconds=wake_offset_seconds,
             session_id=session_id,
@@ -188,6 +191,7 @@ class EtcdCronJobStore:
             app_id=app_id,
             work_mode=work_mode,
             user_id=user_id,
+            slack_session_trusted=slack_session_trusted,
         )
         async with self._lock:
             try:

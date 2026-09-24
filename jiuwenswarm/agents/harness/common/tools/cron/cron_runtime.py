@@ -492,6 +492,10 @@ def _extract_legacy_params(
             out["description"] = description
         if targets:
             out["targets"] = targets
+        if "post_as_root" in delivery:
+            out["post_as_root"] = bool(delivery.get("post_as_root"))
+        elif "post_as_root" in data:
+            out["post_as_root"] = bool(data.get("post_as_root"))
         if "name" in data:
             out["name"] = str(data.get("name") or "").strip()
         if "id" in data:

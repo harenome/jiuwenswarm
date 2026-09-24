@@ -31,6 +31,20 @@ if TYPE_CHECKING:
 
 PREVIOUS_SESSION_MODE_KEY = "_session_previous_mode"
 
+# Values that appear in a session's stored ``mode`` but are not runtime modes.
+# History records have a ``mode`` tag of their own (subagent projections use
+# ``subagent``, and a record written before the turn's mode was resolved falls
+# back to ``unknown``), and ``update_session_metadata`` writes ``mode``
+# overwrite-style, so either can end up on disk as the session's mode.  A
+# request with no explicit ``mode`` inherits the stored value and
+# AgentManager keys its agent instances by it, so inheriting one of these would
+# route the session to a second, empty JiuWenSwarm instance: a fresh DeepAgent
+# and a fresh interaction for a session that already has one.  Skip them and
+# let the generic resolver pick the real mode instead.  ``append_history_record``
+# no longer writes ``subagent`` here, but sessions written before that fix keep
+# the corrupt value on disk, and this guard is what lets them recover.
+_NON_RUNTIME_SESSION_MODES = frozenset({"subagent", "unknown"})
+
 CHAT_TURN_METHODS = frozenset(
     {
         ReqMethod.CHAT_SEND,
@@ -359,12 +373,25 @@ async def prepare_chat_turn(
         )
         if isinstance(stored_session_mode, str) and stored_session_mode.strip():
             stored_session_mode = stored_session_mode.strip()
-            params[PREVIOUS_SESSION_MODE_KEY] = stored_session_mode
-            if not explicit_mode_provided:
-                # Internal turns (including Heartbeat) inherit the Session's
-                # locked mode without turning that inheritance into an
-                # explicit client-requested transition.
-                params["mode"] = stored_session_mode
+            if stored_session_mode.lower() in _NON_RUNTIME_SESSION_MODES:
+                # A history-record tag that reached the session's mode; see
+                # ``_NON_RUNTIME_SESSION_MODES``.  Not a mode any agent can be
+                # keyed on, and not a previous mode the code-mode state can
+                # reason about, so drop it entirely.
+                logger.warning(
+                    "[prepare_chat_turn] ignoring non-runtime stored session "
+                    "mode %r for session=%s",
+                    stored_session_mode,
+                    session_id,
+                )
+                stored_session_mode = ""
+            else:
+                params[PREVIOUS_SESSION_MODE_KEY] = stored_session_mode
+                if not explicit_mode_provided:
+                    # Internal turns (including Heartbeat) inherit the Session's
+                    # locked mode without turning that inheritance into an
+                    # explicit client-requested transition.
+                    params["mode"] = stored_session_mode
         if isinstance(stored_work_mode, str) and stored_work_mode.strip().lower() in {
             "code",
             "work",

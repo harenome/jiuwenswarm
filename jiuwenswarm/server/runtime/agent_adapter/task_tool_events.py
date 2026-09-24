@@ -61,7 +61,7 @@ def _build_projection(
         build_subagent_updated_payload,
     )
 
-    return build_subagent_updated_payload(
+    projection = build_subagent_updated_payload(
         subagent_id=sub_session_id,
         subagent_type=normalized_type,
         display_name=display_name,
@@ -74,6 +74,10 @@ def _build_projection(
         status=status,
         revision=revision,
     )
+    # Slack counts TaskTool dispatches by tool call id. Its roster updates are
+    # for Web and must not count those same dispatches a second time.
+    projection["dispatch_source"] = "task_tool"
+    return projection
 
 
 def apply_task_tool_event_patch() -> None:

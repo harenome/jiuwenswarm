@@ -168,6 +168,8 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    # 审批提示走交互卡片，按钮回调再转回 chat.user_answer。
+    renders_interactive_prompts = True
     _ws_loop_proxy_lock = threading.Lock()
     _ws_loop_proxy_installed = False
 

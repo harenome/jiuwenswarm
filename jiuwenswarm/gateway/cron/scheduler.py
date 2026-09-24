@@ -25,6 +25,7 @@ from jiuwenswarm.gateway.cron.models import (
     resolve_cron_job_timeout_seconds,
 )
 from jiuwenswarm.gateway.cron.store_base import CronJobStoreBackend
+from jiuwenswarm.common.slack_routing import slack_history_metadata_for_cron_job
 from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
 from jiuwenswarm.runtime.events import TERMINAL_ERROR_EVENT_TYPES
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
@@ -1182,6 +1183,7 @@ class CronSchedulerService:
                 cron_expr="",
                 timezone=state.timezone or "Asia/Shanghai",
                 targets=state.targets or "",
+                post_as_root=store_job.post_as_root,
                 session_id=state.session_id,
                 chat_type=state.chat_type,
             )
@@ -1367,6 +1369,26 @@ class CronSchedulerService:
                 # 未配置（None）时保持既有行为（仅 init 全局默认集）。
                 if job.mcp:
                     params["mcp"] = list(job.mcp)
+                # A cron run has no conversation of its own, so anything it may
+                # read has to be stated on the request rather than inferred from
+                # it. For a job whose Slack session was proven at creation that
+                # is the job record's own conversation -- never
+                # ``job.description``, which is the part a model wrote. Every
+                # other job gets ``{}`` and the runtime mounts nothing.
+                request_metadata: dict[str, Any] = {
+                    "cron": {
+                        "job_id": job.id,
+                        "run_id": run_id,
+                        # 传给 UserTurn 信封：让「打印当前时间」类任务按任务
+                        # 时区渲染 timezone/timestamp，而非固定 Asia/Shanghai。
+                        "timezone": job.timezone,
+                    },
+                    # 真实推送渠道（普通模式 channel 是内部 "__cron__"）。
+                    # AgentServer 用它注册 send_file 等按渠道开关的工具，并作为
+                    # 文件推送的 channel_id，与 cron 文本结果推送到同一批渠道。
+                    "targets": str(job.targets or "").strip(),
+                }
+                request_metadata.update(slack_history_metadata_for_cron_job(job))
                 envelope = e2a_from_agent_fields(
                     request_id=f"cron-{run_id}",
                     channel_id=channel_id,
@@ -1375,19 +1397,7 @@ class CronSchedulerService:
                     params=params,
                     is_stream=is_team_cron_mode(mode),
                     timestamp=self._now_fn(),
-                    metadata={
-                        "cron": {
-                            "job_id": job.id,
-                            "run_id": run_id,
-                            # 传给 UserTurn 信封：让「打印当前时间」类任务按任务
-                            # 时区渲染 timezone/timestamp，而非固定 Asia/Shanghai。
-                            "timezone": job.timezone,
-                        },
-                        # 真实推送渠道（普通模式 channel 是内部 "__cron__"）。
-                        # AgentServer 用它注册 send_file 等按渠道开关的工具，并作为
-                        # 文件推送的 channel_id，与 cron 文本结果推送到同一批渠道。
-                        "targets": str(job.targets or "").strip(),
-                    },
+                    metadata=request_metadata,
                     user_id=job.user_id or None,
                 )
                 if not str(job.user_id or "").strip():
@@ -2134,6 +2144,13 @@ class CronSchedulerService:
 
         if metadata is None:
             metadata = {}
+        # The only producer of this key, which
+        # ``SlackChannel._resolve_delivery_target`` reads to blank the thread.
+        # Written here rather than at the Slack rung because ``post_as_root`` is
+        # a property of the job, and this is the one place a delivery knows which
+        # job it belongs to. Channels that do not understand it ignore it.
+        if job.post_as_root:
+            metadata["post_as_root"] = True
         if channel_id == "dingtalk":
             # 仅用可用的钉钉 staffId / delivery binding 补路由；禁止把 dingtalk_… 内部会话当 staffId。
             if routing_sid and not str(metadata.get("dingtalk_sender_id") or "").strip():

@@ -72,6 +72,11 @@ class ChannelManager(ABC):
         # 下一次 on_config_updated 时强制重启的 channel_id（例如微信解绑：YAML 中 bot_token 本就为空时配置 dict 对比不会变，但内存里仍有旧凭据）
         self._pending_channel_restart: set[str] = set()
         self._dispatch_diag_count: int = 0
+        # channel_id values whose "cannot say which instance" drop has already
+        # been reported. See ``resolve_outbound_channel``: the condition is a
+        # standing property of the configuration and one of its producers is
+        # periodic, so it is worth one line and not one line per interval.
+        self._unroutable_reported: set[str] = set()
         # Channel 连接事件订阅回调列表
         self._channel_event_callbacks: list[Callable[[ChannelEvent], Awaitable[None]]] = []
 
@@ -90,6 +95,132 @@ class ChannelManager(ABC):
         for key, ch in self._channels.items():
             if key.channel_id == channel_id:
                 return ch
+        return None
+
+    @staticmethod
+    def _channel_claims(channel: Any, msg: "Message") -> bool:
+        """Ask one channel whether an outbound message is its own.
+
+        Duck-typed on ``claims_message`` so the manager stays free of every
+        platform's notion of an account. A platform whose instances cannot tell
+        their own messages apart does not implement it and is never asked.
+
+        A hook that raises answers "not mine". It runs inside the dispatch loop,
+        and one channel's bad answer must not stop the queue.
+        """
+        claims = getattr(channel, "claims_message", None)
+        if not callable(claims):
+            return False
+        try:
+            return bool(claims(msg))
+        except Exception:
+            logger.exception(
+                "[ChannelManager] claims_message failed: channel_id=%s app_id=%s id=%s",
+                getattr(channel, "channel_id", "?"),
+                getattr(channel, "app_id", "?"),
+                getattr(msg, "id", ""),
+            )
+            return False
+
+    def resolve_outbound_channel(self, msg: "Message") -> "BaseChannel | None":
+        """Which registered instance one outbound message is to be delivered by.
+
+        Three rungs, narrowest first.
+
+        1. The exact ``ChannelKey``. ``app_id`` is put on a request by the
+           channel that received it and comes back on the reply, so this is the
+           precise route and it settles almost every message.
+        2. The only instance of that ``channel_id``, when there is only one.
+           Nothing to disambiguate, and nothing is asked: a single-workspace
+           deployment delivers a message naming no account exactly as it always
+           did, whether or not the connection has finished identifying itself.
+        3. Otherwise the instances are asked which of them the message belongs
+           to. See ``_channel_claims``.
+
+        **Rung 3 refuses rather than guesses.** This used to fall through to
+        ``_get_channel_by_id``, which returns whichever instance the index
+        happened to hold first. With one account configured that is the right
+        answer and the only answer; with several it silently posts one account's
+        reply into another, which is a disclosure rather than a missed message.
+        So an unattributable message is dropped with a line naming it, and the
+        first-match behaviour is kept for exactly the platforms that cannot say
+        -- those whose instances implement no ``claims_message`` -- because for
+        them nothing has changed and refusing would break a working deployment.
+
+        **The drop is reported once per ``channel_id``.** Two of the producers
+        that reach rung 3 are periodic, and both can be aimed at Slack:
+
+        * ``GatewayHealthCheckService`` relays each probe's answer to
+          ``relay_channel_id`` -- named ``HEARTBEAT_RELAY_CHANNEL_ID`` in the
+          environment and ``target`` on the settings page -- every
+          ``interval_seconds``, 60 by default, under a ``health_check_…``
+          session id and with no metadata.
+        * ``CronScheduler._push_to_targets`` pushes a job whose target is
+          ``slack`` on the job's own schedule. When the job was made from the
+          web panel or the TUI there is no Slack session to store, and the
+          metadata backfill beside it has a branch for feishu, dingtalk,
+          xiaoyi, whatsapp, wecom and wechat but none for slack.
+
+        Neither names a workspace, so on a deployment with two of them nobody
+        claims either and the unlatched warning repeated for as long as the
+        process ran. What it reports is a standing property of the
+        configuration rather than an event, and it does not become more true on
+        the hundredth interval. Subsequent drops of the same ``channel_id`` are
+        logged at DEBUG, so the message is still traceable rather than
+        vanishing without a line.
+
+        The latch is not cleared when the instance set changes. A change that
+        resolves the condition -- dropping back to one instance -- stops the
+        drops at rung 2 and never reaches here, and a change that leaves it
+        standing has nothing new to report.
+        """
+        channel_id = getattr(msg, "channel_id", "") or ""
+        resolver = getattr(self._message_handler, "resolve_app_id", None)
+        app_id = (resolver(msg) or "") if callable(resolver) else ""
+        if app_id:
+            channel = self.get_by_key(ChannelKey(channel_id, app_id))
+            if channel is not None:
+                return channel
+
+        candidates = self.get_channels_by_id(channel_id)
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
+
+        if not any(
+            callable(getattr(ch, "claims_message", None)) for ch in candidates
+        ):
+            return candidates[0]
+
+        claimed = [ch for ch in candidates if self._channel_claims(ch, msg)]
+        if len(claimed) == 1:
+            return claimed[0]
+        if len(claimed) > 1:
+            # Two instances answering to one account: the same credentials
+            # configured twice. Delivering to both would post the reply twice,
+            # so the first stands and the duplicate is named.
+            logger.warning(
+                "[ChannelManager] %d 个 %s 实例都认领了同一条消息（同一账号被配置了多次？）"
+                "，投递给第一个: id=%s session_id=%s",
+                len(claimed), channel_id,
+                getattr(msg, "id", ""), getattr(msg, "session_id", ""),
+            )
+            return claimed[0]
+        if channel_id in self._unroutable_reported:
+            logger.debug(
+                "[ChannelManager] 无法判定出站消息归属于 %d 个 %s 实例中的哪一个，丢弃"
+                "（该情况已在首次发生时告警）: id=%s session_id=%s app_id=%s",
+                len(candidates), channel_id,
+                getattr(msg, "id", ""), getattr(msg, "session_id", ""), app_id or "-",
+            )
+            return None
+        self._unroutable_reported.add(channel_id)
+        logger.warning(
+            "[ChannelManager] 无法判定出站消息归属于 %d 个 %s 实例中的哪一个，丢弃"
+            "（投递给第一个会把一个账号的回复发到另一个账号）；本告警每个 channel_id "
+            "只发一次，后续同类丢弃记为 DEBUG: id=%s session_id=%s app_id=%s",
+            len(candidates), channel_id,
+            getattr(msg, "id", ""), getattr(msg, "session_id", ""), app_id or "-",
+        )
         return None
 
     def mark_channel_restart_pending(self, channel_id: str) -> None:
@@ -124,15 +255,51 @@ class ChannelManager(ABC):
 
         asyncio.create_task(self._message_handler.handle_message(msg))
 
+    def _report_key_collision(self, key: ChannelKey, channel: Any) -> None:
+        """Say so when a registration displaces another channel under one key.
+
+        ``_channels`` is a plain dict, so a second registration under the same
+        ``ChannelKey`` replaces the first, and the replaced channel is never
+        reached again: its connection stays open and its inbound messages keep
+        arriving, while every outbound message for it goes to its replacement.
+        A platform whose instances do not each carry a distinct ``app_id``
+        produces exactly that -- and produced it in silence, which is how one
+        whole account could vanish from the deployment with nothing in the log
+        to look for.
+
+        The registration still goes through, deliberately. Refusing it would be
+        wrong for the one collision that is not a configuration bug: a stop path
+        that failed to unregister would leave a dead channel keyed here for
+        good, and the live one would never take its place. So the newcomer wins,
+        exactly as before, and the only thing that changes is that the loss is
+        stated.
+
+        Logged at ERROR because there is no reading of it that is fine. Either
+        two instances are sharing an identity they should not share, or a
+        channel that was supposed to be gone is still in the map.
+        """
+        existing = self._channels.get(key)
+        if existing is None or existing is channel:
+            return
+        logger.error(
+            "[ChannelManager] ChannelKey 冲突: key=%s 已被 %s 占用，将被 %s 覆盖；"
+            "被覆盖的实例不会再收到任何出站消息（平台需要为每个实例提供不同的 app_id）",
+            key, type(existing).__name__, type(channel).__name__,
+        )
+
     def register_channel(self, channel: "BaseChannel") -> None:
         """注册 Channel，并为其注册「收到消息时转发给 MessageHandler」的回调."""
         cid = channel.channel_id
         key = ChannelKey(cid, self._resolve_app_id(channel))
+        self._report_key_collision(key, channel)
         self._channels[key] = channel
         channel.on_message(self._on_channel_message)
         self._try_set_event_reporter(channel)
         self._try_wire_file_persist_hook(channel)
-        logger.info("[ChannelManager] 已注册 Channel: channel_id=%s, 当前共 %d 个", cid, len(self._channels))
+        logger.info(
+            "[ChannelManager] 已注册 Channel: channel_id=%s app_id=%s, 当前共 %d 个",
+            cid, key.app_id, len(self._channels),
+        )
 
     def register_channel_with_inbound(
         self,
@@ -141,6 +308,7 @@ class ChannelManager(ABC):
     ) -> None:
         """登记 Channel 并使用自定义入站回调（不替换为默认 _on_channel_message）。"""
         key = ChannelKey(channel.channel_id, self._resolve_app_id(channel))
+        self._report_key_collision(key, channel)
         self._channels[key] = channel
         channel.on_message(on_message)
         self._try_set_event_reporter(channel)
@@ -269,6 +437,7 @@ class ChannelManager(ABC):
             key = channel_id
         else:
             key = ChannelKey(channel_id, self._resolve_app_id(channel))
+        self._report_key_collision(key, channel)
         self._channels[key] = channel
 
     async def deliver_to_message_handler(self, msg: "Message") -> None:
@@ -415,6 +584,11 @@ class ChannelManager(ABC):
         V2: 支持通过 metadata.fan_out_targets 进行 team 模式多目标分发。
         """
         from jiuwenswarm.gateway.routing.session_sharing import dispatch_to_session
+        # Local for the same reason as the line above: ``base`` pulls the gateway
+        # routing types in, and ``jiuwenswarm.gateway`` re-exports
+        # ``ChannelManager`` lazily so that importing the name costs a module
+        # rather than a runtime. See ``test_gateway_lazy_exports``.
+        from jiuwenswarm.gateway.channel_manager.base import outgoing_for_channel
 
         # 仅当 MessageHandler 提供 consume_robot_messages 时才能派发
         consume = getattr(self._message_handler, "consume_robot_messages", None)
@@ -523,7 +697,7 @@ class ChannelManager(ABC):
                     )
                     for ch in targets:
                         try:
-                            await ch.send(fanout_msg)
+                            await ch.send(outgoing_for_channel(ch, fanout_msg))
                         except Exception as e:
                             logger.error(
                                 "[ChannelManager] 飞书 fan-out 投递失败: channel_id=%s app=%s id=%s: %s",
@@ -533,18 +707,10 @@ class ChannelManager(ABC):
                     continue
 
                 # ── 兜底：旧单 channel 投递（非 team 模式）──
-                # V2: 优先按 ChannelKey 精确路由（多应用场景下同一 channel_id 对应多个 app）
-                channel = None
+                # 精确 ChannelKey 优先，其次唯一实例，最后由各实例自己认领；
+                # 多实例且无人认领时丢弃而不是猜第一个。见 resolve_outbound_channel。
                 app_id = self._message_handler.resolve_app_id(msg)
-                if app_id:
-                    channel = self.get_by_key(ChannelKey(msg.channel_id, app_id))
-                    if channel is not None:
-                        logger.debug(
-                            "[ChannelManager] 精确路由 ChannelKey(%s, %s) -> %s",
-                            msg.channel_id, app_id, getattr(channel, "channel_id", type(channel).__name__),
-                        )
-                if channel is None:
-                    channel = self._get_channel_by_id(msg.channel_id)
+                channel = self.resolve_outbound_channel(msg)
                 # 出站派发节点：定位"队列堆积/前端无输出"时，开启 DEBUG 可确认 chunk 是否
                 # 被消费、命中哪个 channel 实例（tui 走 GatewayServer、web 走 WebChannel）。
                 logger.debug(
@@ -555,7 +721,7 @@ class ChannelManager(ABC):
                 )
                 if channel:
                     try:
-                        await channel.send(msg)
+                        await channel.send(outgoing_for_channel(channel, msg))
                     except Exception as e:
                         logger.error("send to channel %s: %s", msg.channel_id, e, exc_info=True)
                         if msg.id and msg.id.startswith("cron-push-"):

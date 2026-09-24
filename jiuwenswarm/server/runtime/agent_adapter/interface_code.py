@@ -1037,7 +1037,14 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             for tool in getattr(rail, 'tools', []) or []:
                 if hasattr(tool, '_workspace_path'):
                     setattr(tool, '_workspace_path', self._agent_workspace_dir)
-        initial_workspace = self._project_dir or self._agent_workspace_dir
+        # Same ordering constraint as the deep adapter: ``start_interaction``
+        # starts the controller's long-lived TaskScheduler right after this, and
+        # everything under it inherits this CwdState through its copied Context,
+        # so the session has to be named here. This value also anchors
+        # ``fs_operation``'s sandbox for the whole session, because
+        # ``_reseed_runtime_cwd`` moves the cwd and keeps the workspace where
+        # this put it, unless a later turn names a different root.
+        initial_workspace = self._initial_runtime_workspace()
         self._seed_runtime_cwd(initial_workspace, workspace=initial_workspace)
 
         setattr(self._instance, "_jiuwenswarm_adapter_mode", "code")
@@ -2214,7 +2221,10 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             # project or automatically allocated projectless task workspace.
             deep_config.cwd = task_cwd
             deep_config.project_root = str(runtime_paths.project_root)
-        self._seed_runtime_cwd(task_cwd, workspace=project_workspace)
+        # ``_reseed_runtime_cwd`` rather than ``_seed_runtime_cwd``: by this point
+        # the controller's TaskScheduler is running on the CwdState installed at
+        # construction, and only a mutation of that object reaches it.
+        self._reseed_runtime_cwd(task_cwd, workspace=project_workspace)
         resolved_language = self._resolve_runtime_language()
         resolved_channel = str(runtime_config.channel_id or
                                self._resolve_prompt_channel(runtime_config.session_id) or "web").strip() or "web"

@@ -534,10 +534,13 @@ class SessionDispatcher:
             )
             return
 
+        # base 模块 import 本模块的 RoutingTarget，就地 import 断环。
+        from jiuwenswarm.gateway.channel_manager.base import outgoing_for_channel
+
         routing_target = SessionDispatcher._build_routing_target(target, group_subs, delivery)
         try:
             await asyncio.wait_for(
-                channel.send(msg, routing_target=routing_target),
+                channel.send(outgoing_for_channel(channel, msg), routing_target=routing_target),
                 timeout=10.0,
             )
         except asyncio.TimeoutError:

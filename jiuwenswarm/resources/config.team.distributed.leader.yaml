@@ -422,8 +422,119 @@ channels:
     app_token:
     allow_from: []
     allowed_channel_ids: []
+    # How far the Slack history tool may read:
+    # disabled | origin | members | visible | open. See
+    # jiuwenswarm/resources/config.yaml for what each word means and for the
+    # two lists below.
+    history: disabled
+    # Conversations that may never be read as a target, whoever asks.
+    history_never_read: []
+    # Members whose presence does not block the membership check.
+    history_exempt_members: []
+    # How far the Slack posting tools may write:
+    # disabled | origin | members | open. See jiuwenswarm/resources/config.yaml
+    # for what each word means, for why this is a separate key from history, and
+    # for what "members" confirms before posting.
+    write: disabled
+    # Deprecated predecessor of history; history wins whenever it names a word.
+    # [] -> disabled, ["*"] -> origin, a list of ids -> disabled with a warning.
+    history_digest_channel_ids: []
     default_channel_id:
     reply_in_thread: true
+    # The connector-wide default for what the bot reads in channels. To give one
+    # conversation a different set of triggers, a standing prompt, or its own
+    # model, write a scope for it -- see the scopes block below.
+    group_chat_mode: mention
+    acknowledge_mode: reaction
+    # Deprecated predecessor of acknowledge_mode: true means text, false means
+    # off. Only read when acknowledge_mode is unset. Left empty rather than
+    # false so a config upgrade against this template keeps an operator's own
+    # value; a value-less key is read as unset. See config.yaml.
+    acknowledge_requests:
+    acknowledgement_text: "Received. Analyzing…"
+    # Level for the slack_bolt and slack_sdk logger trees: CRITICAL, ERROR,
+    # WARNING (default), INFO or DEBUG. Those two sit outside the jiuwenswarm
+    # logger namespace, so without this they have no handler at all and
+    # everything they report -- including the exceptions slack_bolt catches on
+    # a listener's behalf -- goes nowhere. Its own key rather than
+    # logging.level because they are far chattier: DEBUG writes a line per
+    # websocket frame and per dispatched envelope, which answers "did Slack
+    # actually send us that message?" and is not something to leave on.
+    sdk_log_level: WARNING
+    acknowledgement_emoji: eyes
+    rejected_emoji: no_entry_sign
+    # Show the reply as it is written, rather than posting it once when the turn
+    # ends. Off by default. How the preview is written is chosen per reply
+    # against what Slack will accept for it, not configured here; see
+    # config.yaml. Approval buttons are only shown on a previewed turn, so false
+    # also means a task that asks for permission pauses with nothing on screen.
+    enable_streaming: false
+    # Render a Markdown table as a Block Kit table: "auto" for any table (the
+    # default), "marker" only when the reply asks with
+    # <!-- jiuwenswarm:slack-blocks -->, "off" never. See config.yaml for the
+    # full notes, including why "marker" is inert out of the box.
+    blockkit_tables: auto
+    # Which of Slack's two table blocks a Markdown table becomes:
+    # "data_table" for the one that pages, sorts, filters and downloads (the
+    # default), "basic" for a plain table with every row at once, "off" for no
+    # table block at all. See config.yaml for the full notes, including why the
+    # interactive block is the default and what "off" leaves alone.
+    render_tables: data_table
+    # Which Block Kit block types a reply's own ```blockkit fence may hold.
+    # Empty (the default) restricts nothing. See config.yaml for the full fence
+    # vocabulary and why an unrestricted default is the safe one.
+    blockkit_allowed_block_types: []
+    # Whether such a fence may hold buttons and other elements that post back
+    # to this app. False: real permission-approval buttons live in these same
+    # channels and a reader cannot tell a forged one from a real one. See
+    # config.yaml.
+    blockkit_allow_interactive: false
+    # Which Block Kit payloads are checked with Slack's blocks.validate method
+    # before they are sent. One of off | risky | all; risky is the default.
+    #
+    # A send that Slack refuses reports "invalid_blocks" and nothing else, which
+    # says something in the payload was wrong and never which thing.
+    # blocks.validate answers the same question in advance and, on a refusal,
+    # answers with a JSON pointer to the offending element -- so the reader can
+    # be shown what failed and where instead of silently losing the formatting.
+    # It renders nothing, posts nothing and needs no extra scope.
+    #
+    # It does cost an API call, and Slack rates the method "Special" without
+    # publishing a number. The limit is per method, per workspace, per app, so
+    # validation spends from its own budget and cannot slow down message
+    # delivery however hard it is used.
+    #
+    #   off   -- never call it. Behaviour is exactly what it was before this
+    #            key existed: a refused payload is retried as plain text.
+    #   risky -- call it for the payloads a refusal comes from in practice: a
+    #            reply's own ```blockkit fence, any message holding controls
+    #            to click, and anything unusually large. Everything else is
+    #            built here by typed code and is sent unchecked.
+    #   all   -- call it for every message that holds blocks.
+    #
+    # Whatever the setting, a validation that fails, times out or is rate
+    # limited is never retried and never delays a message: the payload is sent
+    # as it would have been sent anyway, and the after-the-fact fallback still
+    # catches a refusal.
+    blockkit_validate: risky
+    # Group digital avatar (off by default). Needs my_user_id, and is only
+    # useful with group_chat_mode: all. See config.yaml for the full notes.
+    group_digital_avatar: false
+    my_user_id: ""
+    principal_name: ""
+    bot_name: ""
+    enable_memory: false
+    # Uploads need files:write on the bot token.
+    send_file_allowed: true
+    # Show what a turn is doing as one in-progress card -- its todos, the
+    # subagents it dispatched, the tools it ran -- rewritten in place as it
+    # goes. Harness-side facts only: that something ran, is running, or
+    # returned, never whether the work succeeded. See config.yaml for the full
+    # notes. Was subagent_status_card / subagent_card_*, all still read when
+    # these keys are absent.
+    activity_card: true
+    activity_card_delay_seconds: 5
+    activity_card_min_edit_seconds: 10
     enabled: false
   whatsapp:
     # WhatsApp 配置（通过本地 Baileys bridge）

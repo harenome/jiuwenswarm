@@ -26,6 +26,7 @@ class CronTargetChannel(str, Enum):
     WEB = "web"
     TUI = "tui"
     FEISHU = "feishu"
+    SLACK = "slack"
     WHATSAPP = "whatsapp"
     WECOM = "wecom"
     XIAOYI = "xiaoyi"
@@ -73,8 +74,23 @@ def normalize_target_channel_id(
 
 
 def _normalize_targets_str(raw: str) -> str:
-    """将 targets 字符串规范为 CronTargetChannel 枚举值，非法则默认 web。"""
-    return normalize_target_channel_id(raw, default=CronTargetChannel.WEB.value)
+    """将 targets 字符串规范为 CronTargetChannel 枚举值，非法则默认 web。
+
+    反序列化路径故意容忍未知取值（便于迁移），但静默改写会让作业悄悄推送到
+    错误频道，因此这里记录告警。创建路径由 controller 的严格校验把关。
+    """
+    normalized = normalize_target_channel_id(raw, default=CronTargetChannel.WEB.value)
+    original = str(raw or "").strip()
+    # Compare via the validator rather than the strings: a valid
+    # feishu_enterprise:<app_id>:chat:<id> legitimately normalizes to a shorter
+    # form and must not be reported as unknown.
+    if original and not is_valid_target_channel_id(original):
+        logger.warning(
+            "[Cron] unknown targets %r on load; delivering to %r instead",
+            original,
+            normalized,
+        )
+    return normalized
 
 
 # Cron job execution modes (passed to AgentServer as chat.send params["mode"]).
@@ -350,6 +366,9 @@ class CronJob:
     # Target channel ID to push results to (e.g. "web").
     # JSON 字段名仍然叫 targets，用字符串保存频道 ID，兼容旧数据。
     targets: str = ""
+    # Post scheduled results as a new channel message instead of inheriting
+    # the source conversation thread when the target channel supports threads.
+    post_as_root: bool = False
     # SessionMap 形态（如 feishu::chat_id::bot_id::...），仅 feishu_enterprise 投递用；由 AgentServer 上下文写入。
     session_id: str | None = None
     created_at: float | None = None
@@ -382,6 +401,14 @@ class CronJob:
     # from_dict 仅做 normalize + 兜底 "work"，不做跨层 Project 反查；
     # 精确值由创建/更新路径从 Project 记录注入，或由展示层二次查询覆盖。
     work_mode: str = DEFAULT_WEB_WORK_MODE
+    # Whether ``session_id`` was proven, at creation time, to be the creating
+    # request's own Slack session (see ``slack_routing`` for the rule). Recorded
+    # rather than re-derived: the request that could prove it is gone by the time
+    # the job runs, and the string alone proves nothing, since ``session_id`` is
+    # accepted verbatim on the gateway RPC paths. Only a job with this flag set
+    # may present a Slack conversation to the runtime's history gate. Default
+    # False, so any path that does not establish provenance is untrusted.
+    slack_session_trusted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -397,6 +424,8 @@ class CronJob:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.post_as_root:
+            d["post_as_root"] = True
         if self.session_id:
             d["session_id"] = self.session_id
         if self.chat_type:
@@ -422,6 +451,10 @@ class CronJob:
             d["app_id"] = self.app_id
         if self.user_id:
             d["user_id"] = self.user_id
+        # Emitted only when true, like every other optional field: an absent
+        # key and a false one mean the same thing.
+        if self.slack_session_trusted:
+            d["slack_session_trusted"] = True
         return d
 
     @staticmethod
@@ -490,6 +523,8 @@ class CronJob:
 
         targets_str = _normalize_targets_str(targets_str)
 
+        post_as_root = bool(data.get("post_as_root", False))
+
         sid_raw = data.get("session_id", None)
         job_session_id = (
             str(sid_raw).strip()
@@ -550,6 +585,9 @@ class CronJob:
             data.get("work_mode"), default=DEFAULT_WEB_WORK_MODE
         )
 
+        # slack_session_trusted：老数据兜底（无该字段 → False，即不可信）
+        job_slack_session_trusted = bool(data.get("slack_session_trusted", False))
+
         return CronJob(
             id=job_id,
             name=name,
@@ -560,6 +598,7 @@ class CronJob:
             wake_offset_seconds=wake_offset_seconds,
             description=description,
             targets=targets_str,
+            post_as_root=post_as_root,
             session_id=job_session_id,
             created_at=created_at_f,
             updated_at=updated_at_f,
@@ -574,6 +613,7 @@ class CronJob:
             app_id=job_app_id,
             user_id=job_user_id,
             work_mode=job_work_mode,
+            slack_session_trusted=job_slack_session_trusted,
         )
 
 

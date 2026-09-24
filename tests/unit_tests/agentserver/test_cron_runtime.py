@@ -159,6 +159,23 @@ def test_extract_legacy_params_delivery_channel_takes_priority_over_targets() ->
     assert out["targets"] == "web"
 
 
+def test_extract_legacy_params_maps_delivery_post_as_root() -> None:
+    context = SimpleNamespace(
+        channel_id="slack",
+        session_id="slack_T1_C1_1710000000.000100",
+    )
+    payload = {
+        "schedule": {"kind": "cron", "expr": "0 8 * * *"},
+        "payload": {"kind": "agentTurn", "message": "daily report"},
+        "delivery": {"channel": "slack", "post_as_root": True},
+    }
+
+    out = _extract_legacy_params(payload, context=context, require_schedule=True)
+
+    assert out["targets"] == "slack"
+    assert out["post_as_root"] is True
+
+
 def test_extract_legacy_params_context_mode_takes_priority_over_payload() -> None:
     context = SimpleNamespace(
         channel_id="web",
@@ -699,6 +716,37 @@ async def test_cron_tools_create_job_resolves_route_project_dir(tmp_path, monkey
     synced = push.payloads[-1]["body"]["data"]
     assert synced["project_dir"] == str(project_dir)
     assert synced["project_id"] == project.project_id
+
+
+@pytest.mark.asyncio
+async def test_cron_tools_create_job_defaults_to_slack_route(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_project_store(tmp_path, monkeypatch)
+    tools, push = _make_cron_tools(tmp_path, monkeypatch)
+    session_id = "slack_T1_C1_1710000000.000100"
+
+    token = tools.push_cron_route(
+        CronToolRoute(channel_id="slack", session_id=session_id)
+    )
+    try:
+        job = await tools.create_job(
+            {
+                "id": "job-slack",
+                "name": "daily",
+                "cron_expr": "0 8 * * *",
+                "timezone": "Europe/Paris",
+                "description": "hello",
+            }
+        )
+    finally:
+        tools.reset_cron_route(token)
+
+    assert job["targets"] == "slack"
+    assert job["session_id"] == session_id
+    synced = push.payloads[-1]["body"]["data"]
+    assert synced["targets"] == "slack"
+    assert synced["session_id"] == session_id
 
 
 @pytest.mark.asyncio
@@ -1406,3 +1454,72 @@ class TestBuildToolsAllowCreate:
         result = await unified._func(action="list")
 
         assert result == {"jobs": [{"id": "job-1"}]}
+
+
+@pytest.mark.asyncio
+async def test_cron_tools_create_job_records_a_proven_slack_session(
+    tmp_path, monkeypatch
+) -> None:
+    """A job made on a Slack turn is recorded as naming that conversation.
+
+    The session id here is not something the model passed in -- ``create_job``
+    drops any ``session_id`` in the tool arguments and takes the route's instead
+    -- so the request itself is what vouches for it. The flag is what a later
+    run reads; the string alone is not enough, because the gateway RPCs accept
+    one verbatim from callers that were never in Slack at all.
+    """
+    _setup_project_store(tmp_path, monkeypatch)
+    tools, push = _make_cron_tools(tmp_path, monkeypatch)
+    session_id = "slack_T1_C1_1710000000.000100"
+
+    token = tools.push_cron_route(
+        CronToolRoute(channel_id="slack", session_id=session_id)
+    )
+    try:
+        job = await tools.create_job(
+            {
+                "id": "job-slack-trusted",
+                "name": "daily",
+                "cron_expr": "0 8 * * *",
+                "timezone": "Europe/Paris",
+                "description": "hello",
+                # A model asking to vouch for itself; dropped like session_id.
+                "slack_session_trusted": True,
+            }
+        )
+    finally:
+        tools.reset_cron_route(token)
+
+    assert job["session_id"] == session_id
+    assert job["slack_session_trusted"] is True
+    assert push.payloads[-1]["body"]["data"]["slack_session_trusted"] is True
+    # The push holds the creating request's own channel and session, which is
+    # what lets the gateway reach the same verdict without trusting the flag.
+    assert push.payloads[-1]["channel_id"] == "slack"
+    assert push.payloads[-1]["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_cron_tools_create_job_on_a_web_turn_is_not_a_slack_session(
+    tmp_path, monkeypatch
+) -> None:
+    _setup_project_store(tmp_path, monkeypatch)
+    tools, _push = _make_cron_tools(tmp_path, monkeypatch)
+
+    token = tools.push_cron_route(
+        CronToolRoute(channel_id="web", session_id="web_1710000000")
+    )
+    try:
+        job = await tools.create_job(
+            {
+                "id": "job-web",
+                "name": "daily",
+                "cron_expr": "0 8 * * *",
+                "timezone": "Europe/Paris",
+                "description": "hello",
+            }
+        )
+    finally:
+        tools.reset_cron_route(token)
+
+    assert "slack_session_trusted" not in job
