@@ -13,9 +13,9 @@ from __future__ import annotations
 import pytest
 
 from jiuwenswarm.common.auth.model_catalog import LoginModel
+from jiuwenswarm.common.channels import CRON_TARGET_CHANNEL_IDS
 from jiuwenswarm.gateway.cron.models import (
     CronJob,
-    CronTargetChannel,
     normalize_cron_job_mcp,
     resolve_cron_model,
     validate_cron_model,
@@ -397,7 +397,7 @@ def _job_dict(targets: str) -> dict:
     }
 
 
-@pytest.mark.parametrize("targets", ["telegram", "slack", "discord", "no-such-channel"])
+@pytest.mark.parametrize("targets", ["no-such-channel"])
 def test_cron_job_from_dict_rejects_unknown_target(targets: str) -> None:
     """未知频道之前被改写成 web：任务创建成功，结果却推到 Web 面板。"""
     with pytest.raises(ValueError, match=f"Invalid targets '{targets}'"):
@@ -406,10 +406,10 @@ def test_cron_job_from_dict_rejects_unknown_target(targets: str) -> None:
 
 def test_cron_job_from_dict_error_lists_accepted_targets() -> None:
     with pytest.raises(ValueError) as exc:
-        CronJob.from_dict(_job_dict("telegram"))
+        CronJob.from_dict(_job_dict("no-such-channel"))
     message = str(exc.value)
-    for channel in CronTargetChannel:
-        assert channel.value in message
+    for channel in CRON_TARGET_CHANNEL_IDS:
+        assert channel in message
     assert "feishu_enterprise:<app_id>" in message
 
 
@@ -435,14 +435,14 @@ def test_cron_job_store_create_rejects_unknown_target(tmp_path) -> None:
 
     path = tmp_path / "cron_jobs.json"
     store = FileCronJobStore(path=path)
-    with pytest.raises(ValueError, match="Invalid targets 'telegram'"):
+    with pytest.raises(ValueError, match="Invalid targets 'no-such-channel'"):
         asyncio.run(
             store.create_job(
                 name="daily",
                 cron_expr="0 0 9 * * ? *",
                 timezone="Asia/Shanghai",
                 description="hello",
-                targets="telegram",
+                targets="no-such-channel",
             )
         )
     assert not path.exists()

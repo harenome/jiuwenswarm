@@ -18,9 +18,9 @@ from __future__ import annotations
 import pytest
 
 from jiuwenswarm.agents.harness.common.tools.cron.cron_tools import CronTools
+from jiuwenswarm.common.channels import CRON_TARGET_CHANNEL_IDS, ChannelType
 from jiuwenswarm.gateway.cron.controller import CronController
 from jiuwenswarm.gateway.cron.models import (
-    CronTargetChannel,
     is_valid_target_channel_id,
     normalize_target_channel_id,
 )
@@ -28,7 +28,7 @@ from jiuwenswarm.gateway.cron.store import CronJobStore
 
 
 def test_slack_is_a_declared_cron_target() -> None:
-    assert CronTargetChannel.SLACK.value == "slack"
+    assert ChannelType.SLACK.value == "slack"
     assert is_valid_target_channel_id("slack")
     assert is_valid_target_channel_id("SLACK")
     assert normalize_target_channel_id("SLACK") == "slack"
@@ -74,8 +74,8 @@ def test_the_controller_still_names_every_target_it_accepts() -> None:
     with pytest.raises(ValueError) as excinfo:
         controller._normalize_targets("not-a-channel")
     message = str(excinfo.value)
-    for channel in CronTargetChannel:
-        assert channel.value in message, message
+    for channel in CRON_TARGET_CHANNEL_IDS:
+        assert channel in message, message
 
 
 @pytest.mark.parametrize("owner", [CronController, CronTools])
