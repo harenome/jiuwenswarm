@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
+from jiuwenswarm.common.channels import CRON_TARGET_CHANNEL_IDS, ChannelType
 from jiuwenswarm.common.work_mode import (
     DEFAULT_WEB_WORK_MODE,
     normalize_work_mode,
@@ -18,20 +18,6 @@ from jiuwenswarm.common.mode_matrix import (
 from jiuwenswarm.runtime.cron.cron_expr import validate_cron_expression
 
 logger = logging.getLogger(__name__)
-
-
-class CronTargetChannel(str, Enum):
-    """推送频道枚举。"""
-
-    WEB = "web"
-    TUI = "tui"
-    FEISHU = "feishu"
-    WHATSAPP = "whatsapp"
-    WECOM = "wecom"
-    XIAOYI = "xiaoyi"
-    WECHAT = "wechat"
-    DINGTALK = "dingtalk"
-    SLACK = "slack"
 
 
 def _feishu_enterprise_app_id(s: str) -> str:
@@ -48,15 +34,11 @@ def is_valid_target_channel_id(raw: str) -> bool:
         return False
     if s.startswith("feishu_enterprise:"):
         return bool(_feishu_enterprise_app_id(s))
-    try:
-        CronTargetChannel(s.lower())
-        return True
-    except ValueError:
-        return False
+    return s.lower() in CRON_TARGET_CHANNEL_IDS
 
 
 def normalize_target_channel_id(
-    raw: str, *, default: str = CronTargetChannel.WEB.value
+    raw: str, *, default: str = ChannelType.WEB.value
 ) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -67,25 +49,16 @@ def normalize_target_channel_id(
             return f"feishu_enterprise:{app_id}"
         return default
     low = s.lower()
-    try:
-        return CronTargetChannel(low).value
-    except ValueError:
-        return default
+    return low if low in CRON_TARGET_CHANNEL_IDS else default
 
 
 def _normalize_targets_str(raw: str) -> str:
-    """将 targets 字符串规范为 CronTargetChannel 枚举值，非法则拒绝。
-
-    ``from_dict`` 是 create/update 的校验入口（``build_new_cron_job`` 与
-    ``apply_cron_job_patch`` 都 round-trip 一次）。此处若沿用 ``default=web``
-    兜底，校验对 targets 形同虚设：任务创建成功、推送却落到 Web 面板，
-    既无报错也无日志。其余调用方都先过 ``is_valid_target_channel_id``。
-    """
+    """Normalize a declared target or reject it."""
     s = str(raw or "").strip()
     if not is_valid_target_channel_id(s):
         raise ValueError(
             f"Invalid targets {raw!r}. Valid: "
-            f"{', '.join(c.value for c in CronTargetChannel)}"
+            f"{', '.join(sorted(CRON_TARGET_CHANNEL_IDS))}"
             " or feishu_enterprise:<app_id>"
         )
     return normalize_target_channel_id(s)
