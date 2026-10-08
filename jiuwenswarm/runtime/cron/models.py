@@ -34,7 +34,12 @@ def is_valid_target_channel_id(raw: str) -> bool:
         return False
     if s.startswith("feishu_enterprise:"):
         return bool(_feishu_enterprise_app_id(s))
-    return s.lower() in CRON_TARGET_CHANNEL_IDS
+    if s.lower() in CRON_TARGET_CHANNEL_IDS:
+        return True
+    from jiuwenswarm.extensions.channel_contributions import contributed_spec_for
+
+    spec = contributed_spec_for(s)
+    return bool(spec and spec.delivery)
 
 
 def normalize_target_channel_id(
@@ -49,7 +54,12 @@ def normalize_target_channel_id(
             return f"feishu_enterprise:{app_id}"
         return default
     low = s.lower()
-    return low if low in CRON_TARGET_CHANNEL_IDS else default
+    if low in CRON_TARGET_CHANNEL_IDS:
+        return low
+    from jiuwenswarm.extensions.channel_contributions import contributed_spec_for
+
+    spec = contributed_spec_for(s)
+    return spec.channel_id if spec and spec.delivery else default
 
 
 def _normalize_targets_str(raw: str) -> str:
@@ -59,7 +69,7 @@ def _normalize_targets_str(raw: str) -> str:
         raise ValueError(
             f"Invalid targets {raw!r}. Valid: "
             f"{', '.join(sorted(CRON_TARGET_CHANNEL_IDS))}"
-            " or feishu_enterprise:<app_id>"
+            " or feishu_enterprise:<app_id> or a registered extension channel"
         )
     return normalize_target_channel_id(s)
 
