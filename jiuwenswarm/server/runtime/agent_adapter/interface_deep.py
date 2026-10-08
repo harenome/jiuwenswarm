@@ -419,6 +419,7 @@ from jiuwenswarm.symphony.llm import (
 from jiuwenswarm.common.hooks_config import load_hooks_config
 from jiuwenswarm.extensions.registry import ExtensionRegistry
 from jiuwenswarm.extensions.sdk.agent_plugin import AgentPluginServices
+from jiuwenswarm.common.interrupt_prompt import render_prompt_as_text
 from jiuwenswarm.common.log_preview import preview_text
 from jiuwenswarm.common.stage_timer import StageTimer
 from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unregister_tool
@@ -16153,6 +16154,11 @@ class JiuWenSwarmDeepAdapter:
                                             or parsed.get("code")
                                             or event_type
                                         )
+                            elif event_type == "chat.ask_user_question":
+                                # Surface prompts while waiting for an answer.
+                                prompt_text = render_prompt_as_text(parsed)
+                                if prompt_text:
+                                    collected_content.append(prompt_text)
                 else:
                     parsed = await run_stream_parser(
                         self._parse_stream_chunk,

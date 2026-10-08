@@ -168,6 +168,7 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    renders_interactive_prompts = True
     _ws_loop_proxy_lock = threading.Lock()
     _ws_loop_proxy_installed = False
 
