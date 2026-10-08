@@ -533,6 +533,7 @@ class ChannelManager(ABC):
         V2: 支持通过 metadata.fan_out_targets 进行 team 模式多目标分发。
         """
         from jiuwenswarm.gateway.routing.session_sharing import dispatch_to_session
+        from jiuwenswarm.gateway.channel_manager.base import outgoing_for_channel
 
         # 仅当 MessageHandler 提供 consume_robot_messages 时才能派发
         consume = getattr(self._message_handler, "consume_robot_messages", None)
@@ -641,7 +642,7 @@ class ChannelManager(ABC):
                     )
                     for ch in targets:
                         try:
-                            await ch.send(fanout_msg)
+                            await ch.send(outgoing_for_channel(ch, fanout_msg))
                         except Exception as e:
                             logger.error(
                                 "[ChannelManager] 飞书 fan-out 投递失败: channel_id=%s app=%s id=%s: %s",
@@ -665,7 +666,7 @@ class ChannelManager(ABC):
                 )
                 if channel:
                     try:
-                        await channel.send(msg)
+                        await channel.send(outgoing_for_channel(channel, msg))
                     except Exception as e:
                         logger.error("send to channel %s: %s", msg.channel_id, e, exc_info=True)
                         if msg.id and msg.id.startswith("cron-push-"):

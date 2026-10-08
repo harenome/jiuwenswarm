@@ -2,6 +2,7 @@
 
 import logging
 import asyncio
+from dataclasses import replace
 import inspect
 import time
 from abc import ABC, abstractmethod
@@ -10,6 +11,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
 from jiuwenswarm.common import channels as _channels
+from jiuwenswarm.common.interrupt_prompt import render_prompt_as_text
 from jiuwenswarm.common.schema.message import Message
 from jiuwenswarm.gateway.routing.session_sharing import RoutingTarget
 
@@ -113,6 +115,8 @@ class BaseChannel(ABC):
 
     name: str = "base"
 
+    renders_interactive_prompts: bool = False
+
     def __init__(self, config: Any, router: RobotMessageRouter):
         """
         初始化Channel
@@ -204,6 +208,8 @@ class BaseChannel(ABC):
 
 class BaseWebChannel(BaseChannel):
 
+    renders_interactive_prompts = True
+
     def __init__(self, config: Any, router: RobotMessageRouter):
         """
         初始化Channel
@@ -269,3 +275,28 @@ class BaseWebChannel(BaseChannel):
             return Response(status.value, status.phrase, Headers(headers), _UNAUTHORIZED_BODY)
 
         return status, headers, _UNAUTHORIZED_BODY
+
+
+def outgoing_for_channel(channel: BaseChannel, msg: Message) -> Message:
+    """将无法交互的审批提示转为纯文本，其余消息原样返回。"""
+    from jiuwenswarm.common.schema.message import EventType
+
+    if msg.event_type != EventType.CHAT_ASK_USER_QUESTION:
+        return msg
+    if getattr(channel, "renders_interactive_prompts", False):
+        return msg
+    payload = msg.payload if isinstance(msg.payload, dict) else {}
+    text = render_prompt_as_text(payload)
+    if not text:
+        return msg
+
+    logger.info(
+        "[%s] chat.ask_user_question 无法渲染，降级为文本: id=%s",
+        getattr(channel, "channel_id", getattr(channel, "name", "unknown")),
+        getattr(msg, "id", ""),
+    )
+    return replace(
+        msg,
+        event_type=EventType.CHAT_FINAL,
+        payload={"event_type": EventType.CHAT_FINAL.value, "content": text},
+    )
