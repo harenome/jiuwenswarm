@@ -36,7 +36,13 @@ _ATTACHMENT_KEYS = (
 def is_shared_im_channel(channel_id: object) -> bool:
     """Return whether this channel reuses the shared IM session-input path."""
     channel = channel_for_id(channel_id)
-    return channel is not None and channel.value in SHARED_IM_CHANNEL_IDS
+    if channel is not None and channel.value in SHARED_IM_CHANNEL_IDS:
+        return True
+    from jiuwenswarm.extensions.channel_contributions import contributed_spec_for
+
+    channel_id = str(channel_id or "").strip().lower().split(":", 1)[0]
+    spec = contributed_spec_for(channel_id)
+    return bool(spec and spec.shared_im_input)
 
 
 def prepare_im_session_input(msg: Message) -> bool:
