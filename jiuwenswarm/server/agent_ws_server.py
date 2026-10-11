@@ -167,7 +167,7 @@ from jiuwenswarm.common.security.ws_origin import (
 from jiuwenswarm.agents.harness.code.prompt.plan_approval import (
     PLAN_MODE_EXITED_EVENT_TYPE,
 )
-from jiuwenswarm.common.schema.message import ReqMethod, parse_req_method
+from jiuwenswarm.common.schema.message import ContributedReqMethod, ReqMethod, parse_req_method
 from jiuwenswarm.server.personal_context import PersonalContextHostAPI
 from jiuwenswarm.server.personal_context.ws_handler import (
     PERSONAL_CONTEXT_REQUEST_METHODS as _PERSONAL_CONTEXT_REQ_METHODS,
@@ -2468,6 +2468,8 @@ class AgentWebSocketServer:
 
             if await self._dispatch_gateway_adapter_request(ws, request, send_lock):
                 return
+            if isinstance(request.req_method, ContributedReqMethod):
+                raise ValueError(f"unsupported method: {request.req_method.value}")
 
             if request.req_method in {
                 ReqMethod.CHAT_SEND, ReqMethod.CHAT_RESUME, ReqMethod.CHAT_ANSWER,

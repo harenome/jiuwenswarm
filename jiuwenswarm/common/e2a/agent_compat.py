@@ -25,7 +25,9 @@ def _e2a_timestamp_to_float(ts: str | None) -> float:
         return 0.0
 
 
-def e2a_to_agent_request(env: E2AEnvelope) -> AgentRequest:
+def e2a_to_agent_request(
+    env: E2AEnvelope, *, allow_unregistered: bool = False
+) -> AgentRequest:
     """
     将规范化成功的 E2A 转为 AgentRequest。
 
@@ -41,7 +43,7 @@ def e2a_to_agent_request(env: E2AEnvelope) -> AgentRequest:
     req_method: ReqMethod | ContributedReqMethod | None = None
     if method_str:
         try:
-            req_method = parse_req_method(method_str)
+            req_method = parse_req_method(method_str, allow_unregistered=allow_unregistered)
         except ValueError:
             logger.error(
                 "[E2A][compat] unknown E2A method=%r request_id=%s",

@@ -31,7 +31,7 @@ def payload_to_request(data: dict[str, Any]) -> AgentRequest:
     """Parse a legacy JSON payload into ``AgentRequest``."""
     req_method = data.get("req_method")
     if req_method is not None and isinstance(req_method, str):
-        req_method = parse_req_method(req_method)
+        req_method = parse_req_method(req_method, allow_unregistered=True)
     metadata = data.get("metadata")
     if isinstance(metadata, dict):
         metadata = {
@@ -92,7 +92,8 @@ def parse_raw_message(raw: str | bytes) -> AgentRequest | dict[str, Any]:
         env.method,
         env.is_stream,
     )
-    return e2a_to_agent_request(env)
+    # The Worker owns extension registration and validates method names.
+    return e2a_to_agent_request(env, allow_unregistered=True)
 
 
 def encode_response(response: AgentResponse, *, response_id: str) -> dict[str, Any]:

@@ -225,3 +225,102 @@ def test_a_protected_adapter_method_would_be_refused_whatever_configuration_says
         register_gateway_adapter(_ProtectedAdapter())
     assert key in str(excinfo.value)
     assert not overrides.override_permitted(ADAPTER_KIND, LIST)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_front_without_extensions_routes_custom_methods_and_rejects_unknown(legacy):
+    import json
+    import subprocess
+    import sys
+
+    from jiuwenswarm.common.e2a.wire_codec import parse_agent_server_wire_unary
+    from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
+    from jiuwenswarm.common.schema.message import ContributedReqMethod
+    from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
+    from jiuwenswarm.server.ipc.protocol import KIND_REQUEST, KIND_REQUEST_DONE, KIND_WIRE
+    from jiuwenswarm.server.worker.dispatcher import WorkerDispatcher
+    from jiuwenswarm.server.worker.gateway_bridge import ConnHolder, WorkerGatewayBridge
+
+    class EchoAdapter(_Adapter):
+        calls = []
+
+        async def handle(self, request):
+            self.calls.append(request)
+            return AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=True, payload={"echo": request.params},
+            )
+
+    class Capture:
+        frames = []
+
+        async def send(self, message):
+            self.frames.append(message)
+
+    adapter = EchoAdapter({PING})
+    register_gateway_adapter(adapter)
+    runtime = AgentWebSocketServer.__new__(AgentWebSocketServer)
+    runtime._adapter_registry = _mounted()[0]
+
+    async def not_handled(*args):
+        return False
+
+    runtime._handle_gateway_cron_callback = not_handled
+    runtime._handle_lifecycle_request = not_handled
+    conn = Capture()
+    holder = ConnHolder()
+    holder.open_session(conn)
+    dispatcher = WorkerDispatcher(WorkerGatewayBridge(holder))
+    await dispatcher.bind_runtime(runtime)
+
+    for method in (PING, "echo.unknown"):
+        data = (
+            {"request_id": method, "channel_id": "slack", "req_method": method,
+             "params": {"text": "hello"}}
+            if legacy else
+            e2a_from_agent_fields(request_id=method, channel_id="slack",
+                                  req_method=method, params={"text": "hello"}).to_dict()
+        )
+        # A fresh Front process has no contributed-method registrations.
+        parsed = subprocess.run(
+            [sys.executable, "-c", "\n".join([
+                "import json, sys",
+                "from jiuwenswarm.common.schema.message import _contributed_req_methods",
+                "from jiuwenswarm.server.front.protocol import parse_raw_message",
+                "from jiuwenswarm.server.ipc.protocol import dump_agent_request",
+                "assert not _contributed_req_methods",
+                "print(json.dumps(dump_agent_request(parse_raw_message(sys.stdin.read()))))",
+            ])],
+            input=json.dumps(data), text=True, capture_output=True, check=True,
+        )
+        payload = json.loads(parsed.stdout)
+        assert payload["req_method"] == method
+        conn.frames.clear()
+        await dispatcher.handle(
+            {"kind": KIND_REQUEST, "request_id": method, "payload": payload}, conn
+        )
+        if method == PING:
+            await asyncio.wait_for(asyncio.gather(*dispatcher._tasks), 2)
+            assert conn.frames[0]["kind"] == KIND_WIRE
+            assert parse_agent_server_wire_unary(conn.frames[0]["payload"]).ok is True
+            assert adapter.calls[0].params == {"text": "hello"}
+            assert conn.frames[-1]["delivered"] is True
+        else:
+            assert len(conn.frames) == 1
+            assert conn.frames[0]["kind"] == KIND_REQUEST_DONE
+            assert conn.frames[0]["ok"] is False
+            assert method in conn.frames[0]["error"]
+            assert conn.frames[0]["request_id"] == method
+            assert conn.frames[0]["delivered"] is False
+            assert len(adapter.calls) == 1
+            conn.frames.clear()
+            await runtime.dispatch_parsed_request(
+                WorkerGatewayBridge(holder),
+                AgentRequest(request_id=method, channel_id="slack",
+                             req_method=ContributedReqMethod(method), params={}),
+                asyncio.Lock(),
+            )
+            assert conn.frames[0]["kind"] == KIND_WIRE
+            assert parse_agent_server_wire_unary(conn.frames[0]["payload"]).ok is False
+            assert "unsupported method" in json.dumps(conn.frames[0])

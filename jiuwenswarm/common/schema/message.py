@@ -480,11 +480,13 @@ class ContributedReqMethod(str):
 _contributed_req_methods: set[str] = set()
 
 
-def parse_req_method(value: str) -> ReqMethod | ContributedReqMethod:
+def parse_req_method(
+    value: str, *, allow_unregistered: bool = False
+) -> ReqMethod | ContributedReqMethod:
     try:
         return ReqMethod(value)
     except ValueError:
-        if value not in _contributed_req_methods:
+        if not allow_unregistered and value not in _contributed_req_methods:
             raise
         return ContributedReqMethod(value)
 

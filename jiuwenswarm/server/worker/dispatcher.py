@@ -122,7 +122,18 @@ class WorkerDispatcher:
                     error="missing payload",
                 )
                 return True
-            self._spawn(self._run_request(load_agent_request(payload), generation), generation)
+            try:
+                request = load_agent_request(payload)
+            except ValueError as exc:
+                await self._done(
+                    conn,
+                    str(message.get("request_id") or ""),
+                    generation=generation,
+                    ok=False,
+                    error=str(exc),
+                )
+                return True
+            self._spawn(self._run_request(request, generation), generation)
             return True
         logger.info("[Worker] ignored ipc kind=%s", kind)
         return True
